@@ -50,6 +50,22 @@ impl Cluster {
         Api::namespaced_with(self.kube.clone(), namespace, &resource)
     }
 
+    /// Kyverno's results for namespaced resources, in every namespace.
+    pub fn policy_reports(&self) -> Api<DynamicObject> {
+        self.reports("PolicyReport", "policyreports")
+    }
+
+    /// Kyverno's results for cluster-scoped resources.
+    pub fn cluster_policy_reports(&self) -> Api<DynamicObject> {
+        self.reports("ClusterPolicyReport", "clusterpolicyreports")
+    }
+
+    fn reports(&self, kind: &str, plural: &str) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk("wgpolicyk8s.io", "v1alpha2", kind);
+        let resource = ApiResource::from_gvk_with_plural(&gvk, plural);
+        Api::all_with(self.kube.clone(), &resource)
+    }
+
     /// The last log lines of the step that failed the run.
     pub async fn failure_logs(&self, run: &DynamicObject) -> anyhow::Result<String> {
         let selector = format!("tekton.dev/pipelineRun={}", run_name(run));

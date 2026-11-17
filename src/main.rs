@@ -49,6 +49,10 @@ async fn main() -> anyhow::Result<()> {
         cluster.clone(),
         config.tekton_forget_after,
     ));
+    for reports in [cluster.policy_reports(), cluster.cluster_policy_reports()] {
+        let ops_room = cluster.ops_room.clone();
+        tokio::spawn(alerts::watch_kyverno(client.clone(), reports, ops_room));
+    }
     tokio::spawn(alerts::poll_tofu(client.clone(), cluster, config.tofu_poll));
     let user = client.user_id().context("no user ID after login")?;
     info!(%user, "ready");

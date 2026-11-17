@@ -1,10 +1,11 @@
-//! Posts CI runs and pending tofu plans to the ops room.
+//! Posts CI runs, pending tofu plans and Kyverno policy failures to the ops room.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use kube::Api;
 use kube::api::DynamicObject;
 use kube::runtime::{WatchStreamExt, watcher};
 use matrix_sdk::Client;
@@ -12,10 +13,11 @@ use matrix_sdk::ruma::events::relation::Reply;
 use matrix_sdk::ruma::events::room::message::{
     Relation, ReplacementMetadata, RoomMessageEventContent,
 };
-use matrix_sdk::ruma::{OwnedEventId, RoomId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, RoomId};
 use tracing::{error, warn};
 
 use crate::cluster::{Cluster, RunState, run_link, run_name, run_state};
+use crate::commands::kyverno::{self, Failure};
 use crate::commands::tofu::Plan;
 use crate::markdown::{code_block, tail};
 
@@ -119,6 +121,32 @@ pub async fn poll_tofu(client: Client, cluster: Cluster, every: Duration) {
     }
 }
 
+/// Watches forever, posting each policy failure once, when it first shows up
+/// in a report. Failures already there when the bot starts stay quiet.
+pub async fn watch_kyverno(client: Client, reports: Api<DynamicObject>, ops_room: OwnedRoomId) {
+    let events = watcher::watcher(reports, watcher::Config::default()).default_backoff();
+    let mut events = pin!(events);
+    let mut failing = Failing::default();
+    while let Some(event) = events.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                warn!("watching PolicyReports failed: {err:#}");
+                continue;
+            }
+        };
+        for line in failing.change(&event) {
+            let text = format!("🛡️ **Kyverno:** {line}");
+            post(
+                &client,
+                &ops_room,
+                RoomMessageEventContent::text_markdown(text),
+            )
+            .await;
+        }
+    }
+}
+
 /// Sends to the ops room. The event ID is what a later edit refers to.
 async fn post(
     client: &Client,
@@ -186,6 +214,53 @@ impl Running {
     /// No run lasts this long: its end was missed, e.g. it was deleted while the watch was down.
     fn forget_older_than(&mut self, age: Duration) {
         self.0.retain(|_, tracked| tracked.since.elapsed() < age);
+    }
+}
+
+/// The `(policy, rule)` pairs failing in each report, by report UID. Kyverno
+/// rewrites reports at every background scan, so only a pair a report didn't
+/// have before is new.
+/// shortcut: reports deleted while the watch is down are never forgotten, harmless until churn is huge.
+#[derive(Default)]
+struct Failing {
+    reports: HashMap<String, HashSet<(String, String)>>,
+    /// Set once the first listing is done: before that, failures are only recorded.
+    listed: bool,
+}
+
+impl Failing {
+    /// The failures to post: new in a report, after the first listing.
+    fn change(&mut self, event: &watcher::Event<DynamicObject>) -> Vec<String> {
+        let report = match event {
+            watcher::Event::Init => return Vec::new(),
+            watcher::Event::InitDone => {
+                self.listed = true;
+                return Vec::new();
+            }
+            watcher::Event::Delete(report) => {
+                if let Some(uid) = report.metadata.uid.as_deref() {
+                    self.reports.remove(uid);
+                }
+                return Vec::new();
+            }
+            // A re-list after a watch error diffs too, catching what failed meanwhile.
+            watcher::Event::InitApply(report) | watcher::Event::Apply(report) => report,
+        };
+        let Some(uid) = report.metadata.uid.clone() else {
+            return Vec::new();
+        };
+        let key = |failure: &Failure| (failure.policy.to_owned(), failure.rule.to_owned());
+        let failures = kyverno::failures(report);
+        let now = failures.iter().map(key).collect();
+        let before = self.reports.insert(uid, now).unwrap_or_default();
+        if !self.listed {
+            return Vec::new();
+        }
+        failures
+            .iter()
+            .filter(|failure| !before.contains(&key(failure)))
+            .map(Failure::line)
+            .collect()
     }
 }
 
@@ -261,6 +336,43 @@ mod tests {
         assert_eq!(running.0.len(), 1);
         running.forget_older_than(Duration::ZERO);
         assert!(running.0.is_empty());
+    }
+
+    #[test]
+    fn posts_each_policy_failure_once() {
+        use serde_json::json;
+
+        use crate::commands::kyverno::test_report;
+
+        let fail = |policy: &str| json!({ "policy": policy, "rule": policy, "result": "fail", "message": "no" });
+        let mut failing = Failing::default();
+
+        // Failing before the bot started: quiet.
+        let old = watcher::Event::InitApply(test_report("a", &json!([fail("signed")])));
+        assert!(failing.change(&old).is_empty());
+        assert!(failing.change(&watcher::Event::InitDone).is_empty());
+
+        // A background scan rewrites the same results: quiet. A new failure: posted.
+        assert!(
+            failing
+                .change(&watcher::Event::Apply(test_report(
+                    "a",
+                    &json!([fail("signed")])
+                )))
+                .is_empty()
+        );
+        let both = test_report("a", &json!([fail("signed"), fail("labels")]));
+        let posted = failing.change(&watcher::Event::Apply(both));
+        assert_eq!(posted.len(), 1);
+        assert!(posted[0].starts_with("`labels` on ReplicaSet"));
+
+        // Fixed then broken again: posted again. A re-list catches what failed meanwhile.
+        failing.change(&watcher::Event::Apply(test_report("a", &json!([]))));
+        let again = watcher::Event::InitApply(test_report("a", &json!([fail("signed")])));
+        assert_eq!(failing.change(&again).len(), 1);
+
+        failing.change(&watcher::Event::Delete(test_report("a", &json!([]))));
+        assert!(failing.reports.is_empty());
     }
 
     #[test]

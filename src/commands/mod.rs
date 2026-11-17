@@ -5,6 +5,7 @@
 
 mod ci;
 mod help;
+pub mod kyverno;
 mod ping;
 pub mod tofu;
 
@@ -17,7 +18,13 @@ use tracing::warn;
 use crate::cluster::Cluster;
 
 /// Every registered command, in `!help` order.
-pub const ALL: &[Command] = &[help::COMMAND, ping::COMMAND, ci::COMMAND, tofu::COMMAND];
+pub const ALL: &[Command] = &[
+    help::COMMAND,
+    ping::COMMAND,
+    ci::COMMAND,
+    tofu::COMMAND,
+    kyverno::COMMAND,
+];
 
 pub struct Command {
     pub name: &'static str,
