@@ -1,4 +1,4 @@
-# tekton-matrix-bot
+# kubbot
 
 Matrix bot for the homelab, built on [matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) (E2EE capable).
 It joins rooms it's invited to and answers `!commands` (`!help` lists them) as replies.

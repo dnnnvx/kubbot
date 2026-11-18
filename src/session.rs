@@ -126,7 +126,7 @@ async fn password_login(
     client
         .matrix_auth()
         .login_username(user, password)
-        .initial_device_display_name("tekton-matrix-bot")
+        .initial_device_display_name("kubbot")
         .await?;
     let session = client
         .matrix_auth()

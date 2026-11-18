@@ -1947,6 +1947,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kubbot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "libsqlite3-sys",
+ "matrix-sdk",
+ "matrix-sdk-store-encryption",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kube"
 version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3990,27 +4011,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "tekton-matrix-bot"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "futures-util",
- "http",
- "k8s-openapi",
- "kube",
- "libsqlite3-sys",
- "matrix-sdk",
- "matrix-sdk-store-encryption",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

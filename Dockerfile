@@ -24,7 +24,7 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked
 
 FROM --platform=linux/amd64 gcr.io/distroless/cc-debian13:nonroot
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/tekton-matrix-bot /usr/local/bin/tekton-matrix-bot
+COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/kubbot /usr/local/bin/kubbot
 ENV DATA_DIR=/data
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/tekton-matrix-bot"]
+ENTRYPOINT ["/usr/local/bin/kubbot"]
