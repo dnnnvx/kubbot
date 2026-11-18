@@ -138,34 +138,34 @@ where
         })
 }
 
-/// Watches forever, posting each problem `find` sees on an object once, when
-/// it shows up. Problems already there when the bot starts stay quiet, and one
-/// that flaps, e.g. a flaky signature check or a crash loop, is posted at most
-/// once per `repost_after`.
-pub async fn watch_problems<K>(
-    client: Client,
-    api: Api<K>,
-    ops_room: OwnedRoomId,
-    repost_after: Duration,
-    find: impl Fn(&K) -> Vec<Problem>,
-) where
-    K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
-{
-    let key = format!("tekton.problems{}", api.resource_url());
-    let mut problems = Problems::load(&client, &key).await;
-    let mut events = pin!(events(api));
-    while let Some(event) = events.next().await {
-        problems.forget_posted_older_than(repost_after);
-        for line in problems.change(&event, &find) {
-            post(
-                &client,
-                &ops_room,
-                RoomMessageEventContent::text_markdown(line),
-            )
-            .await;
-        }
-        if mem::take(&mut problems.changed) {
-            save(&client, &key, &problems).await;
+/// Where problems are posted, and how often a flapping one may be.
+#[derive(Clone)]
+pub struct Alerter {
+    pub client: Client,
+    pub ops_room: OwnedRoomId,
+    /// A problem that flaps, e.g. a flaky signature check or a crash loop, is posted at most once per this.
+    pub repost_after: Duration,
+}
+
+impl Alerter {
+    /// Watches forever, posting each problem `find` sees on an object once,
+    /// when it shows up.
+    pub async fn watch_problems<K>(self, api: Api<K>, find: impl Fn(&K) -> Vec<Problem>)
+    where
+        K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
+    {
+        let key = format!("tekton.problems{}", api.resource_url());
+        let mut problems = Problems::load(&self.client, &key).await;
+        let mut events = pin!(events(api));
+        while let Some(event) = events.next().await {
+            problems.forget_posted_older_than(self.repost_after);
+            for line in problems.change(&event, &find) {
+                let content = RoomMessageEventContent::text_markdown(line);
+                post(&self.client, &self.ops_room, content).await;
+            }
+            if mem::take(&mut problems.changed) {
+                save(&self.client, &key, &problems).await;
+            }
         }
     }
 }
