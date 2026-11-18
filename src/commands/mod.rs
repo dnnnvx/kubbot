@@ -7,6 +7,7 @@ mod ci;
 mod help;
 pub mod kyverno;
 mod ping;
+mod problems;
 pub mod tofu;
 
 use std::future::Future;
@@ -24,6 +25,7 @@ pub const ALL: &[Command] = &[
     ci::COMMAND,
     tofu::COMMAND,
     kyverno::COMMAND,
+    problems::COMMAND,
 ];
 
 pub struct Command {

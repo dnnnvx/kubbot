@@ -24,7 +24,7 @@ use tracing::{error, warn};
 use crate::cluster::{Cluster, RunState, run_link, run_name, run_state};
 use crate::commands::tofu::Plan;
 use crate::markdown::{code_block, tail};
-use crate::problems::Problem;
+use crate::problems::{self, Problem};
 
 /// Enough for the error, short enough to read in a chat. An event caps at 65 KB.
 const MAX_LOG_BYTES: usize = 4_000;
@@ -284,6 +284,9 @@ struct Problems {
     /// Something to save since the last save.
     #[serde(skip)]
     changed: bool,
+    /// What the first listing of a first start found, posted as one summary when it's done.
+    #[serde(skip)]
+    found_first: Vec<String>,
 }
 
 impl Problems {
@@ -314,8 +317,17 @@ impl Problems {
                 let before = self.keys.len();
                 self.keys.retain(|uid, _| listing.contains(uid));
                 self.changed |= self.keys.len() != before;
+                // Saved right away, so a restart before anything else happens isn't a first start again.
+                self.changed |= !self.listed;
                 self.listed = true;
-                return Vec::new();
+                let found = mem::take(&mut self.found_first);
+                if found.is_empty() {
+                    return Vec::new();
+                }
+                return vec![problems::summary(
+                    "Already broken when the bot started watching",
+                    &found,
+                )];
             }
             watcher::Event::Delete(object) => {
                 if let Some(uid) = object.meta().uid.as_deref() {
@@ -340,6 +352,8 @@ impl Problems {
             self.keys.insert(uid.clone(), now);
         }
         if !self.listed {
+            self.found_first
+                .extend(problems.into_iter().map(|problem| problem.line));
             return Vec::new();
         }
         let posted = self.posted.entry(uid).or_default();
@@ -428,7 +442,6 @@ fn message(dashboard_url: &str, run: &DynamicObject, logs: Option<&str>) -> Stri
 mod tests {
     use super::*;
     use crate::cluster::test_run;
-    use crate::problems;
 
     fn event_id() -> OwnedEventId {
         "$start:example.org".parse().unwrap()
@@ -518,10 +531,14 @@ mod tests {
         let mut problems = Problems::default();
         let mut change = |event| problems.change(&event, problems::policy_failures);
 
-        // Failing before the bot started: quiet.
+        // Failing at the first start: one summary once listed, not an alert each.
         let report = |results| test_report("a", &json!(results));
         assert!(change(watcher::Event::InitApply(report(vec![fail("signed")]))).is_empty());
-        assert!(change(watcher::Event::InitDone).is_empty());
+        let summary = change(watcher::Event::InitDone);
+        assert_eq!(summary.len(), 1);
+        assert!(
+            summary[0].starts_with("**Already broken when the bot started watching:** 1\n\n- 🛡️")
+        );
 
         // A background scan rewrites the same results: quiet. A new failure: posted.
         assert!(change(watcher::Event::Apply(report(vec![fail("signed")]))).is_empty());

@@ -14,7 +14,7 @@ It joins rooms it's invited to and answers `!commands` (`!help` lists them) as r
 | `DATA_DIR` | no (`/data`) | holds `store/` |
 | `HEALTH_ADDR` | no (`0.0.0.0:8080`) | where the health probes are served |
 | `TEKTON_DASHBOARD_URL` | yes | e.g. `https://tekton.local.casasulgorgo.net`, for links to CI runs |
-| `OPS_ROOM` | yes | room ID, the only room where `!ci`, `!tofu` and `!kyverno` answer and where CI runs, tofu plans, policy failures and stuck pods are posted; use an encrypted, invite-only room |
+| `OPS_ROOM` | yes | room ID, the only room where `!ci`, `!tofu`, `!kyverno` and `!problems` answer and where CI runs, tofu plans, policy failures and stuck pods are posted; use an encrypted, invite-only room |
 | `TEKTON_NAMESPACE` | no (`tekton-ci`) | where the PipelineRuns and their pods are |
 | `CI_LOG_LINES` | no (`30`) | how many log lines of a failed CI step are posted |
 | `TOFU_NAMESPACE` | no (`flux-system`) | where the tofu-controller `Terraform` object is |
@@ -44,8 +44,9 @@ The bot talks to Kubernetes with the in-cluster service account, or the local ku
 - `!ci` lists PipelineRuns in `TEKTON_NAMESPACE`, linking to the Tekton dashboard.
 - Each run's start is posted to `OPS_ROOM`, and the message is edited into the result when it ends; since clients usually don't notify on edits, a failure also gets a reply with the last log lines of the failed step. Which runs have a start message is kept in `store/`, so a run that outlives the bot, like the bot's own release, still gets its message edited after a restart. Runs that start and end while the bot is down aren't posted.
 - `!tofu` shows the pending plan of the `TOFU_TERRAFORM` Terraform in `TOFU_NAMESPACE`, and the `kubectl` command to approve it. Applying is left to whoever runs that command. Every `TOFU_POLL_MINUTES`, a pending plan is posted the same way, as a reminder of the drift, once its readable text is stored.
-- `!kyverno` lists the `fail` results in Kyverno's PolicyReports and ClusterPolicyReports, which cover audit-mode policies and background scans. Each failure is also posted when it first shows up in a report: a background scan rewriting the same results stays quiet, a fixed failure that comes back is posted again. Failures already there the first time the bot starts aren't posted; after that, what it has seen is kept in `store/`, so a restart or upgrade reposts nothing and anything that broke while the bot was down is posted when it's back, and one that keeps flapping is posted at most once per `ALERT_REPOST_HOURS`.
+- `!kyverno` lists the `fail` results in Kyverno's PolicyReports and ClusterPolicyReports, which cover audit-mode policies and background scans. Each failure is also posted when it first shows up in a report: a background scan rewriting the same results stays quiet, a fixed failure that comes back is posted again. Failures already there the first time the bot starts are posted together as one summary; after that, what it has seen is kept in `store/`, so a restart or upgrade reposts nothing and anything that broke while the bot was down is posted when it's back, and one that keeps flapping is posted at most once per `ALERT_REPOST_HOURS`.
 - Containers that are OOM-killed, or waiting for one of `POD_STUCK_REASONS`, are posted the same way, in any namespace, an OOM kill with the container's memory limit.
+- `!problems` lists everything the alerts above watch for that's wrong right now, read live from the cluster: failing Kyverno policies and stuck pods.
 
 The service account needs, in `TEKTON_NAMESPACE`: `get`, `list`, `watch` on `pipelineruns`, `list` on `taskruns`, `get` on `pods/log`; in `TOFU_NAMESPACE`: `get` on `terraforms` and `configmaps`; cluster-wide: `list`, `watch` on `pods`, and on `policyreports` and `clusterpolicyreports` (`wgpolicyk8s.io`).
 Failure logs are posted as they are: a step that prints a secret puts it in the room's history.
@@ -88,6 +89,7 @@ The nix dev shell enables it; otherwise run `git config core.hooksPath .githooks
 | `src/handlers.rs` | Matrix event handlers (invites, messages) |
 | `src/cluster.rs` | Kubernetes access shared by commands and alerts |
 | `src/alerts.rs` | posts CI runs, pending tofu plans, Kyverno policy failures and stuck pods to the ops room |
+| `src/problems.rs` | what counts as a problem (failing policies, stuck pods), shared by the alerts and `!problems` |
 | `src/commands/` | command registry, parsing and dispatch, one module per command |
 
 ## Adding a command
