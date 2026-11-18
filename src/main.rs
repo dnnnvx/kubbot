@@ -5,6 +5,7 @@ mod config;
 mod handlers;
 mod health;
 mod markdown;
+mod problems;
 mod session;
 
 use anyhow::Context;
@@ -57,17 +58,17 @@ async fn main() -> anyhow::Result<()> {
             reports,
             ops_room,
             repost_after,
-            alerts::policy_failures,
+            problems::policy_failures,
         );
         tokio::spawn(watch);
     }
-    let reasons = config.pod_stuck_reasons;
+    let reasons = cluster.pod_stuck_reasons.clone();
     tokio::spawn(alerts::watch_problems(
         client.clone(),
         cluster.pods(),
         cluster.ops_room.clone(),
         repost_after,
-        move |pod| alerts::stuck_containers(pod, &reasons),
+        move |pod| problems::stuck_containers(pod, &reasons),
     ));
     tokio::spawn(alerts::poll_tofu(client.clone(), cluster, config.tofu_poll));
     let user = client.user_id().context("no user ID after login")?;

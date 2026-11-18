@@ -1,7 +1,7 @@
-use kube::api::{DynamicObject, ListParams};
+use kube::api::DynamicObject;
 
 use super::{Command, Ctx, Reply};
-use crate::markdown::head;
+use crate::markdown::{MAX_LIST_BYTES, bullets};
 
 pub const COMMAND: Command = Command {
     name: "kyverno",
@@ -11,41 +11,24 @@ pub const COMMAND: Command = Command {
     run: |ctx| Box::pin(run(ctx)),
 };
 
-/// An event caps at 65 KB and holds the text twice, plain and as escaped HTML.
-const MAX_LIST_BYTES: usize = 20_000;
-
 async fn run(ctx: Ctx) -> Reply {
-    let params = ListParams::default();
-    let mut reports = ctx.cluster.policy_reports().list(&params).await?.items;
-    reports.extend(
-        ctx.cluster
-            .cluster_policy_reports()
-            .list(&params)
-            .await?
-            .items,
-    );
-    Ok(render(&reports))
+    Ok(render(&ctx.cluster.list_policy_reports().await?))
 }
 
 fn render(reports: &[DynamicObject]) -> String {
     let lines: Vec<String> = reports
         .iter()
         .flat_map(failures)
-        .map(|failure| format!("- {}", failure.line()))
+        .map(|failure| failure.line())
         .collect();
     if lines.is_empty() {
         return "**Kyverno:** no failing policies.".to_owned();
     }
-    let list = lines.join("\n");
-    let mut reply = format!(
+    format!(
         "**Kyverno:** {} failing\n\n{}",
         lines.len(),
-        head(&list, MAX_LIST_BYTES)
-    );
-    if list.len() > MAX_LIST_BYTES {
-        reply.push_str("\n\nList cut short, see `kubectl get policyreports -A` for the rest.");
-    }
-    reply
+        bullets(&lines, MAX_LIST_BYTES)
+    )
 }
 
 /// A `fail` result of a PolicyReport, on the resource the report is about.

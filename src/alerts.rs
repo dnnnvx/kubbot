@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{future, mem};
 
 use futures_util::{Stream, StreamExt};
-use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use k8s_openapi::serde::de::DeserializeOwned;
 use kube::api::DynamicObject;
 use kube::runtime::{WatchStreamExt, watcher};
@@ -23,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use crate::cluster::{Cluster, RunState, run_link, run_name, run_state};
-use crate::commands::kyverno;
 use crate::commands::tofu::Plan;
 use crate::markdown::{code_block, tail};
+use crate::problems::Problem;
 
 /// Enough for the error, short enough to read in a chat. An event caps at 65 KB.
 const MAX_LOG_BYTES: usize = 4_000;
@@ -171,81 +170,6 @@ pub async fn watch_problems<K>(
     }
 }
 
-/// The failing policies of a PolicyReport.
-pub fn policy_failures(report: &DynamicObject) -> Vec<Problem> {
-    kyverno::failures(report)
-        .iter()
-        .map(|failure| Problem {
-            key: format!("{}/{}", failure.policy, failure.rule),
-            line: format!("🛡️ **Kyverno:** {}", failure.line()),
-        })
-        .collect()
-}
-
-/// The containers of a pod that were OOM-killed or wait for one of `reasons`.
-pub fn stuck_containers(pod: &Pod, reasons: &[String]) -> Vec<Problem> {
-    let Some(status) = &pod.status else {
-        return Vec::new();
-    };
-    let namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
-    let name = pod.metadata.name.as_deref().unwrap_or_default();
-    let containers = status.container_statuses.iter().flatten();
-    let init_containers = status.init_container_statuses.iter().flatten();
-    containers
-        .chain(init_containers)
-        .filter_map(|container| {
-            let reason = stuck_reason(container, reasons)?;
-            let limit = match reason {
-                "OOMKilled" => memory_limit(pod, &container.name)
-                    .map(|limit| format!(", memory limit `{limit}`"))
-                    .unwrap_or_default(),
-                _ => String::new(),
-            };
-            Some(Problem {
-                key: format!("{}/{reason}", container.name),
-                line: format!(
-                    "💥 **Pod:** `{namespace}/{name}` container `{}`: {reason}{limit}",
-                    container.name
-                ),
-            })
-        })
-        .collect()
-}
-
-/// An OOM kill wins: it's the cause of the crash loop that usually follows.
-fn stuck_reason<'a>(container: &'a ContainerStatus, reasons: &[String]) -> Option<&'a str> {
-    let oom_killed = [&container.state, &container.last_state]
-        .iter()
-        .filter_map(|state| state.as_ref()?.terminated.as_ref()?.reason.as_deref())
-        .any(|reason| reason == "OOMKilled");
-    if oom_killed {
-        return Some("OOMKilled");
-    }
-    let waiting = container
-        .state
-        .as_ref()?
-        .waiting
-        .as_ref()?
-        .reason
-        .as_deref()?;
-    reasons
-        .iter()
-        .any(|reason| reason == waiting)
-        .then_some(waiting)
-}
-
-fn memory_limit<'a>(pod: &'a Pod, container: &str) -> Option<&'a str> {
-    let spec = pod.spec.as_ref()?;
-    let init_containers = spec.init_containers.iter().flatten();
-    let found = spec
-        .containers
-        .iter()
-        .chain(init_containers)
-        .find(|spec| spec.name == container)?;
-    let limits = found.resources.as_ref()?.limits.as_ref()?;
-    Some(&limits.get("memory")?.0)
-}
-
 /// Sends to the ops room. The event ID is what a later edit refers to.
 async fn post(
     client: &Client,
@@ -340,13 +264,6 @@ impl Running {
     }
 }
 
-/// Something wrong with an object, as `find` sees it.
-pub struct Problem {
-    /// Tells it apart from the object's other problems, e.g. the policy and rule.
-    key: String,
-    line: String,
-}
-
 /// The problems of each object, to post only the ones it didn't have before:
 /// objects are rewritten often, e.g. Kyverno's reports at every scan. Kept
 /// across restarts, so what broke while the bot was down is posted, and a
@@ -393,11 +310,11 @@ impl Problems {
                 return Vec::new();
             }
             watcher::Event::InitDone => {
-                self.listed = true;
                 let listing = mem::take(&mut self.listing);
                 let before = self.keys.len();
                 self.keys.retain(|uid, _| listing.contains(uid));
                 self.changed |= self.keys.len() != before;
+                self.listed = true;
                 return Vec::new();
             }
             watcher::Event::Delete(object) => {
@@ -511,6 +428,7 @@ fn message(dashboard_url: &str, run: &DynamicObject, logs: Option<&str>) -> Stri
 mod tests {
     use super::*;
     use crate::cluster::test_run;
+    use crate::problems;
 
     fn event_id() -> OwnedEventId {
         "$start:example.org".parse().unwrap()
@@ -598,7 +516,7 @@ mod tests {
 
         let fail = |policy: &str| json!({ "policy": policy, "rule": policy, "result": "fail", "message": "no" });
         let mut problems = Problems::default();
-        let mut change = |event| problems.change(&event, policy_failures);
+        let mut change = |event| problems.change(&event, problems::policy_failures);
 
         // Failing before the bot started: quiet.
         let report = |results| test_report("a", &json!(results));
@@ -627,10 +545,10 @@ mod tests {
         change(watcher::Event::Apply(report(vec![])));
         problems.forget_posted_older_than(Duration::ZERO);
         let again = watcher::Event::Apply(report(vec![fail("signed")]));
-        assert_eq!(problems.change(&again, policy_failures).len(), 1);
+        assert_eq!(problems.change(&again, problems::policy_failures).len(), 1);
 
         let deleted = watcher::Event::Delete(report(vec![]));
-        problems.change(&deleted, policy_failures);
+        problems.change(&deleted, problems::policy_failures);
         assert!(problems.keys.is_empty());
     }
 
@@ -647,11 +565,11 @@ mod tests {
             ..Problems::default()
         };
         let event = watcher::Event::Apply(report("a", vec![fail("signed")]));
-        assert_eq!(problems.change(&event, policy_failures).len(), 1);
+        assert_eq!(problems.change(&event, problems::policy_failures).len(), 1);
         assert!(problems.changed, "a post is saved");
         let healthy = watcher::Event::Apply(report("b", vec![]));
         problems.changed = false;
-        problems.change(&healthy, policy_failures);
+        problems.change(&healthy, problems::policy_failures);
         assert!(!problems.changed, "a healthy object isn't saved");
         assert_eq!(problems.keys.len(), 1);
 
@@ -661,7 +579,7 @@ mod tests {
             listed: true,
             ..serde_json::from_slice(&saved).unwrap()
         };
-        let mut change = |event| problems.change(&event, policy_failures);
+        let mut change = |event| problems.change(&event, problems::policy_failures);
         assert!(change(watcher::Event::Init).is_empty());
         // Still failing: quiet. Broke while the bot was down: posted.
         assert!(change(watcher::Event::InitApply(report("a", vec![fail("signed")]))).is_empty());
@@ -675,49 +593,12 @@ mod tests {
         let event = watcher::Event::InitApply(report("a", vec![fail("signed")]));
         assert!(
             problems
-                .change(&watcher::Event::Init, policy_failures)
+                .change(&watcher::Event::Init, problems::policy_failures)
                 .is_empty()
         );
-        problems.change(&event, policy_failures);
-        problems.change(&watcher::Event::InitDone, policy_failures);
+        problems.change(&event, problems::policy_failures);
+        problems.change(&watcher::Event::InitDone, problems::policy_failures);
         assert_eq!(problems.keys.keys().collect::<Vec<_>>(), ["a"]);
-    }
-
-    #[test]
-    fn finds_stuck_containers() {
-        let pod = |app: serde_json::Value, sidecar: serde_json::Value| -> Pod {
-            serde_json::from_value(serde_json::json!({
-                "metadata": { "name": "reports-1", "namespace": "kyverno", "uid": "p" },
-                "spec": { "containers": [
-                    { "name": "app", "resources": { "limits": { "memory": "128Mi" } } },
-                    { "name": "sidecar" },
-                ] },
-                "status": { "containerStatuses": [
-                    { "name": "app", "image": "", "imageID": "", "ready": false, "restartCount": 3, "lastState": app },
-                    { "name": "sidecar", "image": "", "imageID": "", "ready": false, "restartCount": 0, "state": sidecar },
-                ] },
-            }))
-            .unwrap()
-        };
-        let reasons = ["ImagePullBackOff".to_owned()];
-        let lines = |pod: &Pod| -> Vec<String> {
-            stuck_containers(pod, &reasons)
-                .into_iter()
-                .map(|problem| problem.line)
-                .collect()
-        };
-        let oom = serde_json::json!({ "terminated": { "exitCode": 137, "reason": "OOMKilled" } });
-        let waiting = |reason| serde_json::json!({ "waiting": { "reason": reason } });
-
-        assert_eq!(
-            lines(&pod(oom, waiting("ImagePullBackOff"))),
-            [
-                "💥 **Pod:** `kyverno/reports-1` container `app`: OOMKilled, memory limit `128Mi`",
-                "💥 **Pod:** `kyverno/reports-1` container `sidecar`: ImagePullBackOff",
-            ]
-        );
-        let healthy = serde_json::json!({ "terminated": { "exitCode": 0, "reason": "Completed" } });
-        assert!(lines(&pod(healthy, waiting("ContainerCreating"))).is_empty());
     }
 
     #[test]

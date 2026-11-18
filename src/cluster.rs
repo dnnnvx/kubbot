@@ -18,6 +18,7 @@ pub struct Cluster {
     pub tofu_namespace: String,
     pub tofu_terraform: String,
     pub kubectl_context: String,
+    pub pod_stuck_reasons: Vec<String>,
 }
 
 impl Cluster {
@@ -33,6 +34,7 @@ impl Cluster {
             tofu_namespace: config.tofu_namespace.clone(),
             tofu_terraform: config.tofu_terraform.clone(),
             kubectl_context: config.kubectl_context.clone(),
+            pod_stuck_reasons: config.pod_stuck_reasons.clone(),
         })
     }
 
@@ -64,6 +66,14 @@ impl Cluster {
     /// Kyverno's results for cluster-scoped resources.
     pub fn cluster_policy_reports(&self) -> Api<DynamicObject> {
         self.reports("ClusterPolicyReport", "clusterpolicyreports")
+    }
+
+    /// Kyverno's results, namespaced and cluster-scoped.
+    pub async fn list_policy_reports(&self) -> kube::Result<Vec<DynamicObject>> {
+        let params = ListParams::default();
+        let mut reports = self.policy_reports().list(&params).await?.items;
+        reports.extend(self.cluster_policy_reports().list(&params).await?.items);
+        Ok(reports)
     }
 
     /// Every pod of the cluster.
