@@ -19,7 +19,7 @@ use matrix_sdk::ruma::events::room::message::{
 };
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, RoomId};
 use serde::{Deserialize, Serialize};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::cluster::{Cluster, RunState, run_link, run_name, run_state};
 use crate::commands::tofu::Plan;
@@ -181,14 +181,20 @@ async fn post(
     room_id: &RoomId,
     content: RoomMessageEventContent,
 ) -> Option<OwnedEventId> {
+    // The first line says what the alert is, e.g. `🔴 **CI failed:** [run](…)`.
+    let alert = content.body().lines().next().unwrap_or_default().to_owned();
     let Some(room) = client.get_room(room_id) else {
-        warn!(room = %room_id, "not in the ops room, dropping alert");
+        warn!(room = %room_id, alert, "not in the ops room, dropping alert");
         return None;
     };
     match room.send(content).await {
-        Ok(sent) => Some(sent.response.event_id),
+        Ok(sent) => {
+            let event_id = sent.response.event_id;
+            info!(room = %room_id, event = %event_id, alert, "alert sent");
+            Some(event_id)
+        }
         Err(err) => {
-            error!(room = %room_id, "send failed: {err:#}");
+            error!(room = %room_id, alert, "sending alert failed: {err:#}");
             None
         }
     }

@@ -46,8 +46,14 @@ pub async fn on_message(
             ForwardThread::Yes,
             AddMentions::No,
         );
-        if let Err(err) = room.send(content).await {
-            error!(room = %room.room_id(), "send failed: {err:#}");
+        let (room_id, sender) = (room.room_id(), &event.sender);
+        let command = body.lines().next().unwrap_or_default();
+        match room.send(content).await {
+            Ok(sent) => {
+                let event_id = sent.response.event_id;
+                info!(room = %room_id, %sender, command, event = %event_id, "reply sent");
+            }
+            Err(err) => error!(room = %room_id, %sender, command, "sending reply failed: {err:#}"),
         }
     });
 }
