@@ -60,6 +60,11 @@ impl Cluster {
         self.reports("ClusterPolicyReport", "clusterpolicyreports")
     }
 
+    /// Every pod of the cluster.
+    pub fn pods(&self) -> Api<Pod> {
+        Api::all(self.kube.clone())
+    }
+
     fn reports(&self, kind: &str, plural: &str) -> Api<DynamicObject> {
         let gvk = GroupVersionKind::gvk("wgpolicyk8s.io", "v1alpha2", kind);
         let resource = ApiResource::from_gvk_with_plural(&gvk, plural);

@@ -58,6 +58,12 @@ async fn main() -> anyhow::Result<()> {
             alerts::policy_failures,
         ));
     }
+    tokio::spawn(alerts::watch_problems(
+        client.clone(),
+        cluster.pods(),
+        cluster.ops_room.clone(),
+        alerts::stuck_containers,
+    ));
     tokio::spawn(alerts::poll_tofu(client.clone(), cluster, config.tofu_poll));
     let user = client.user_id().context("no user ID after login")?;
     info!(%user, "ready");

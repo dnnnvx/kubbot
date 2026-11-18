@@ -1,4 +1,4 @@
-//! Posts CI runs, pending tofu plans and Kyverno policy failures to the ops room.
+//! Posts CI runs, pending tofu plans, Kyverno policy failures and stuck pods to the ops room.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -8,6 +8,7 @@ use std::pin::pin;
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
+use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use k8s_openapi::serde::de::DeserializeOwned;
 use kube::api::DynamicObject;
 use kube::runtime::{WatchStreamExt, watcher};
@@ -28,8 +29,15 @@ use crate::markdown::{code_block, tail};
 /// Enough for the error, short enough to read in a chat. An event caps at 65 KB.
 const MAX_LOG_BYTES: usize = 4_000;
 
-/// A problem that flaps, e.g. a flaky signature check, is posted at most once a day.
+/// A problem that flaps, e.g. a flaky signature check or a crash loop, is posted at most once a day.
 const REPOST_AFTER: Duration = Duration::from_secs(24 * 3600);
+
+/// Waiting reasons of a container that won't get better by itself.
+const STUCK_REASONS: [&str; 3] = [
+    "CrashLoopBackOff",
+    "ImagePullBackOff",
+    "CreateContainerConfigError",
+];
 
 /// Watches forever. The watcher re-lists and retries by itself after an error.
 /// A run's start is posted, then edited into its result when it ends; a failure
@@ -170,6 +178,67 @@ pub fn policy_failures(report: &DynamicObject) -> Vec<Problem> {
             line: format!("🛡️ **Kyverno:** {}", failure.line()),
         })
         .collect()
+}
+
+/// The containers of a pod that were OOM-killed or are stuck.
+pub fn stuck_containers(pod: &Pod) -> Vec<Problem> {
+    let Some(status) = &pod.status else {
+        return Vec::new();
+    };
+    let namespace = pod.metadata.namespace.as_deref().unwrap_or_default();
+    let name = pod.metadata.name.as_deref().unwrap_or_default();
+    let containers = status.container_statuses.iter().flatten();
+    let init_containers = status.init_container_statuses.iter().flatten();
+    containers
+        .chain(init_containers)
+        .filter_map(|container| {
+            let reason = stuck_reason(container)?;
+            let limit = match reason {
+                "OOMKilled" => memory_limit(pod, &container.name)
+                    .map(|limit| format!(", memory limit `{limit}`"))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            Some(Problem {
+                key: format!("{}/{reason}", container.name),
+                line: format!(
+                    "💥 **Pod:** `{namespace}/{name}` container `{}`: {reason}{limit}",
+                    container.name
+                ),
+            })
+        })
+        .collect()
+}
+
+/// An OOM kill wins: it's the cause of the crash loop that usually follows.
+fn stuck_reason(container: &ContainerStatus) -> Option<&str> {
+    let oom_killed = [&container.state, &container.last_state]
+        .iter()
+        .filter_map(|state| state.as_ref()?.terminated.as_ref()?.reason.as_deref())
+        .any(|reason| reason == "OOMKilled");
+    if oom_killed {
+        return Some("OOMKilled");
+    }
+    let waiting = container
+        .state
+        .as_ref()?
+        .waiting
+        .as_ref()?
+        .reason
+        .as_deref()?;
+    STUCK_REASONS.contains(&waiting).then_some(waiting)
+}
+
+fn memory_limit<'a>(pod: &'a Pod, container: &str) -> Option<&'a str> {
+    let spec = pod.spec.as_ref()?;
+    let init_containers = spec.init_containers.iter().flatten();
+    let found = spec
+        .containers
+        .iter()
+        .chain(init_containers)
+        .find(|spec| spec.name == container)?;
+    let limits = found.resources.as_ref()?.limits.as_ref()?;
+    Some(&limits.get("memory")?.0)
 }
 
 /// Sends to the ops room. The event ID is what a later edit refers to.
@@ -430,6 +499,42 @@ mod tests {
         let deleted = watcher::Event::Delete(report(vec![]));
         problems.change(&deleted, policy_failures);
         assert!(problems.keys.is_empty());
+    }
+
+    #[test]
+    fn finds_stuck_containers() {
+        let pod = |app: serde_json::Value, sidecar: serde_json::Value| -> Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": "reports-1", "namespace": "kyverno", "uid": "p" },
+                "spec": { "containers": [
+                    { "name": "app", "resources": { "limits": { "memory": "128Mi" } } },
+                    { "name": "sidecar" },
+                ] },
+                "status": { "containerStatuses": [
+                    { "name": "app", "image": "", "imageID": "", "ready": false, "restartCount": 3, "lastState": app },
+                    { "name": "sidecar", "image": "", "imageID": "", "ready": false, "restartCount": 0, "state": sidecar },
+                ] },
+            }))
+            .unwrap()
+        };
+        let lines = |pod: &Pod| -> Vec<String> {
+            stuck_containers(pod)
+                .into_iter()
+                .map(|problem| problem.line)
+                .collect()
+        };
+        let oom = serde_json::json!({ "terminated": { "exitCode": 137, "reason": "OOMKilled" } });
+        let waiting = |reason| serde_json::json!({ "waiting": { "reason": reason } });
+
+        assert_eq!(
+            lines(&pod(oom, waiting("ImagePullBackOff"))),
+            [
+                "💥 **Pod:** `kyverno/reports-1` container `app`: OOMKilled, memory limit `128Mi`",
+                "💥 **Pod:** `kyverno/reports-1` container `sidecar`: ImagePullBackOff",
+            ]
+        );
+        let healthy = serde_json::json!({ "terminated": { "exitCode": 0, "reason": "Completed" } });
+        assert!(lines(&pod(healthy, waiting("ContainerCreating"))).is_empty());
     }
 
     #[test]
