@@ -13,7 +13,8 @@ It joins rooms it's invited to and answers `!commands` (`!help` lists them) as r
 | `RECOVERY_PASSPHRASE` | no | keeps the cross-signing keys on the server, encrypted under it, so a new device can sign itself |
 | `DATA_DIR` | no (`/data`) | holds `store/` |
 | `HEALTH_ADDR` | no (`0.0.0.0:8080`) | where the health probes are served |
-| `TEKTON_DASHBOARD_URL` | yes | e.g. `https://tekton.local.casasulgorgo.net`, for links to CI runs |
+| `DISABLED_FEATURES` | no | comma-separated features to switch off, from `tekton`, `tofu`, `kyverno`, `pods` (see [Cluster access](#cluster-access)) |
+| `TEKTON_DASHBOARD_URL` | unless `tekton` is disabled | e.g. `https://tekton.local.casasulgorgo.net`, for links to CI runs |
 | `OPS_ROOM` | yes | room ID, the only room where `!ci`, `!tofu`, `!kyverno` and `!problems` answer and where CI runs, tofu plans, policy failures and stuck pods are posted; use an encrypted, invite-only room |
 | `TEKTON_NAMESPACE` | no (`tekton-ci`) | where the PipelineRuns and their pods are |
 | `CI_LOG_LINES` | no (`30`) | how many log lines of a failed CI step are posted |
@@ -48,7 +49,15 @@ The bot talks to Kubernetes with the in-cluster service account, or the local ku
 - Containers that are OOM-killed, or waiting for one of `POD_STUCK_REASONS`, are posted the same way, in any namespace, an OOM kill with the container's memory limit. Pods that ran to completion are filtered out by the API server, so finished CI and Job pods cost nothing.
 - `!problems` lists everything the alerts above watch for that's wrong right now, read live from the cluster: failing Kyverno policies and stuck pods.
 
-The service account needs, in `TEKTON_NAMESPACE`: `get`, `list`, `watch` on `pipelineruns`, `list` on `taskruns`, `get` on `pods/log`; in `TOFU_NAMESPACE`: `get` on `terraforms` and `configmaps`; cluster-wide: `list`, `watch` on `pods`, and on `policyreports` and `clusterpolicyreports` (`wgpolicyk8s.io`).
+Each feature can be switched off with `DISABLED_FEATURES`: its commands are gone (from `!help` too), its alerts don't run, and it needs no permissions. `!problems` lists only what the enabled ones watch.
+
+| Feature | What | Service account needs |
+|---------|------|-----------------------|
+| `tekton` | `!ci`, CI run posts | in `TEKTON_NAMESPACE`: `get`, `list`, `watch` on `pipelineruns` (`tekton.dev`), `list` on `taskruns` (`tekton.dev`), `get` on `pods/log` |
+| `tofu` | `!tofu`, pending plan posts | in `TOFU_NAMESPACE`: `get` on `terraforms` (`infra.contrib.fluxcd.io`) and `configmaps` |
+| `kyverno` | `!kyverno`, policy failure posts | cluster-wide: `list`, `watch` on `policyreports` and `clusterpolicyreports` (`wgpolicyk8s.io`) |
+| `pods` | stuck pod posts | cluster-wide: `list`, `watch` on `pods` |
+
 Failure logs are posted as they are: a step that prints a secret puts it in the room's history.
 
 ## Health probes
@@ -103,6 +112,8 @@ pub const COMMAND: Command = Command {
     name: "echo",
     usage: "!echo <text>",
     summary: "repeat the text back",
+    ops_only: false,
+    feature: None,
     run: |ctx| Box::pin(run(ctx)),
 };
 
@@ -113,5 +124,6 @@ async fn run(ctx: Ctx) -> Reply {
 ```
 
 Then declare it with `mod <name>;` in `src/commands/mod.rs` and add it to `ALL`; `!help` picks it up automatically.
+A command that shows cluster state sets `ops_only: true`; one that belongs to a feature sets `feature: Some(Feature::…)` so `DISABLED_FEATURES` turns it off.
 The command gets the client, room, sender, raw arguments and cluster access through `Ctx`; an `Err` is logged and reported to the sender.
 Each command runs in its own task, so slow ones don't hold up the bot.

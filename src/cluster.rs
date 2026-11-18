@@ -9,7 +9,7 @@ use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, LogPar
 use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 use serde::de::DeserializeOwned;
 
-use crate::config::Config;
+use crate::config::{Config, Feature};
 
 /// Pods that can still be stuck: one that ran to completion can't. Failed ones stay, e.g. an OOM-killed Job.
 pub const UNFINISHED_PODS: &str = "status.phase!=Succeeded";
@@ -27,6 +27,7 @@ pub struct Cluster {
     pub tofu_terraform: String,
     pub kubectl_context: String,
     pub pod_stuck_reasons: Vec<String>,
+    disabled: Vec<Feature>,
 }
 
 impl Cluster {
@@ -43,7 +44,12 @@ impl Cluster {
             tofu_terraform: config.tofu_terraform.clone(),
             kubectl_context: config.kubectl_context.clone(),
             pod_stuck_reasons: config.pod_stuck_reasons.clone(),
+            disabled: config.disabled.clone(),
         })
+    }
+
+    pub fn enabled(&self, feature: Feature) -> bool {
+        !self.disabled.contains(&feature)
     }
 
     pub fn pipeline_runs(&self) -> Api<DynamicObject> {

@@ -1,6 +1,7 @@
 use kube::api::DynamicObject;
 
 use super::{Command, Ctx, Reply};
+use crate::config::Feature;
 use crate::markdown::{MAX_LIST_BYTES, bullets};
 
 pub const COMMAND: Command = Command {
@@ -8,6 +9,7 @@ pub const COMMAND: Command = Command {
     usage: "!kyverno",
     summary: "policies failing in Kyverno's reports",
     ops_only: true,
+    feature: Some(Feature::Kyverno),
     run: |ctx| Box::pin(run(ctx)),
 };
 

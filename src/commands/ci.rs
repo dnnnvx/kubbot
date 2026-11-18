@@ -2,12 +2,14 @@ use kube::api::{DynamicObject, ListParams};
 
 use super::{Command, Ctx, Reply};
 use crate::cluster::{RunState, run_link, run_state};
+use crate::config::Feature;
 
 pub const COMMAND: Command = Command {
     name: "ci",
     usage: "!ci [list]",
     summary: "running builds and recent failures",
     ops_only: true,
+    feature: Some(Feature::Tekton),
     run: |ctx| Box::pin(run(ctx)),
 };
 

@@ -7,12 +7,13 @@ pub const COMMAND: Command = Command {
     usage: "!help",
     summary: "this message",
     ops_only: false,
+    feature: None,
     run: |ctx| Box::pin(run(ctx)),
 };
 
-async fn run(_: Ctx) -> Reply {
+async fn run(ctx: Ctx) -> Reply {
     let mut reply = String::from("**Commands**");
-    for command in ALL {
+    for command in ALL.iter().filter(|command| command.enabled(&ctx.cluster)) {
         write!(reply, "\n- `{}`: {}", command.usage, command.summary)?;
         if command.ops_only {
             reply.push_str(" (ops room only)");

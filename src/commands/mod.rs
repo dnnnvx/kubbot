@@ -17,6 +17,7 @@ use matrix_sdk::Room;
 use tracing::warn;
 
 use crate::cluster::Cluster;
+use crate::config::Feature;
 
 /// Every registered command, in `!help` order.
 pub const ALL: &[Command] = &[
@@ -35,7 +36,15 @@ pub struct Command {
     pub summary: &'static str,
     /// Cluster state can be sensitive, so these only run in the ops room.
     pub ops_only: bool,
+    /// The area it belongs to; gone, from `!help` too, when that's disabled.
+    pub feature: Option<Feature>,
     pub run: fn(Ctx) -> BoxFuture<Reply>,
+}
+
+impl Command {
+    pub fn enabled(&self, cluster: &Cluster) -> bool {
+        self.feature.is_none_or(|feature| cluster.enabled(feature))
+    }
 }
 
 /// Markdown sent back as a reply. An error is reported to the sender and logged.
@@ -53,7 +62,7 @@ pub struct Ctx {
 /// Runs the command in `body`. `None` when `body` isn't a command, so the bot stays quiet.
 pub async fn dispatch(body: &str, room: Room, cluster: Cluster) -> Option<String> {
     let (name, args) = parse(body)?;
-    let Some(command) = find(name) else {
+    let Some(command) = find(name).filter(|command| command.enabled(&cluster)) else {
         return Some(format!("unknown command `{name}`, try `!help`"));
     };
     let ctx = Ctx {

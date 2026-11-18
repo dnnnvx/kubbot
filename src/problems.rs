@@ -5,6 +5,7 @@ use kube::api::{DynamicObject, ListParams};
 
 use crate::cluster::{self, Cluster, UNFINISHED_PODS};
 use crate::commands::kyverno;
+use crate::config::Feature;
 use crate::markdown::{MAX_LIST_BYTES, bullets};
 
 /// Something wrong with an object, as `find` sees it.
@@ -16,12 +17,17 @@ pub struct Problem {
 
 /// Every problem in the cluster right now.
 pub async fn current(cluster: &Cluster) -> anyhow::Result<Vec<Problem>> {
-    let mut found = cluster.find_in_policy_reports(policy_failures).await?;
-    let pods = ListParams::default().fields(UNFINISHED_PODS);
-    let reasons = &cluster.pod_stuck_reasons;
-    let stuck =
-        cluster::find_in(&cluster.pods(), pods, |pod| stuck_containers(pod, reasons)).await?;
-    found.extend(stuck);
+    let mut found = Vec::new();
+    if cluster.enabled(Feature::Kyverno) {
+        found.extend(cluster.find_in_policy_reports(policy_failures).await?);
+    }
+    if cluster.enabled(Feature::Pods) {
+        let pods = ListParams::default().fields(UNFINISHED_PODS);
+        let reasons = &cluster.pod_stuck_reasons;
+        let stuck =
+            cluster::find_in(&cluster.pods(), pods, |pod| stuck_containers(pod, reasons)).await?;
+        found.extend(stuck);
+    }
     Ok(found)
 }
 

@@ -41,10 +41,47 @@ pub struct Config {
     pub alert_repost_after: Duration,
     /// Waiting reasons that make a container stuck. An OOM kill always counts.
     pub pod_stuck_reasons: Vec<String>,
+    /// Areas switched off: their commands, alerts and watches don't run.
+    pub disabled: Vec<Feature>,
+}
+
+/// An area of the bot that can be switched off, with the cluster access it needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Feature {
+    /// `!ci` and CI run posts.
+    Tekton,
+    /// `!tofu` and pending plan posts.
+    Tofu,
+    /// `!kyverno`, policy failure posts and their part of `!problems`.
+    Kyverno,
+    /// Stuck pod posts and their part of `!problems`.
+    Pods,
+}
+
+impl Feature {
+    fn parse(name: &str) -> anyhow::Result<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "tekton" => Ok(Self::Tekton),
+            "tofu" => Ok(Self::Tofu),
+            "kyverno" => Ok(Self::Kyverno),
+            "pods" => Ok(Self::Pods),
+            _ => anyhow::bail!(
+                "DISABLED_FEATURES: unknown `{name}`, use tekton, tofu, kyverno, pods"
+            ),
+        }
+    }
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let disabled: Vec<Feature> = list("DISABLED_FEATURES", "")?
+            .iter()
+            .map(|name| Feature::parse(name))
+            .collect::<anyhow::Result<_>>()?;
+        let tekton_dashboard_url = match disabled.contains(&Feature::Tekton) {
+            true => String::new(),
+            false => var("TEKTON_DASHBOARD_URL")?.context("TEKTON_DASHBOARD_URL is required")?,
+        };
         Ok(Self {
             homeserver: var("MATRIX_HOMESERVER")?.context("MATRIX_HOMESERVER is required")?,
             data_dir: var("DATA_DIR")?.unwrap_or_else(|| "/data".into()).into(),
@@ -57,8 +94,7 @@ impl Config {
                 .unwrap_or("0.0.0.0:8080")
                 .parse()
                 .context("HEALTH_ADDR must be <ip>:<port>")?,
-            tekton_dashboard_url: var("TEKTON_DASHBOARD_URL")?
-                .context("TEKTON_DASHBOARD_URL is required")?,
+            tekton_dashboard_url,
             tekton_namespace: var("TEKTON_NAMESPACE")?.unwrap_or_else(|| "tekton-ci".into()),
             ci_log_lines: positive("CI_LOG_LINES", 30)?
                 .try_into()
@@ -77,6 +113,7 @@ impl Config {
                 "POD_STUCK_REASONS",
                 "CrashLoopBackOff,ImagePullBackOff,CreateContainerConfigError",
             )?,
+            disabled,
         })
     }
 }
@@ -120,5 +157,11 @@ mod tests {
     fn splits_lists_and_drops_blanks() {
         let items = list("TEST_UNSET_LIST", " CrashLoopBackOff, ,ImagePullBackOff,").unwrap();
         assert_eq!(items, ["CrashLoopBackOff", "ImagePullBackOff"]);
+    }
+
+    #[test]
+    fn parses_features() {
+        assert_eq!(Feature::parse("Kyverno").unwrap(), Feature::Kyverno);
+        assert!(Feature::parse("flux").is_err());
     }
 }

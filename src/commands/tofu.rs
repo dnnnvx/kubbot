@@ -6,6 +6,7 @@ use kube::api::{DynamicObject, GroupVersionKind};
 
 use super::{Command, Ctx, Reply};
 use crate::cluster::{Cluster, condition};
+use crate::config::Feature;
 use crate::markdown::{code_block, head};
 
 pub const COMMAND: Command = Command {
@@ -13,6 +14,7 @@ pub const COMMAND: Command = Command {
     usage: "!tofu",
     summary: "pending tofu plan, and the command to apply it",
     ops_only: true,
+    feature: Some(Feature::Tofu),
     run: |ctx| Box::pin(run(ctx)),
 };
 

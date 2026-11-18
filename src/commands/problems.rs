@@ -6,6 +6,7 @@ pub const COMMAND: Command = Command {
     usage: "!problems",
     summary: "everything the alerts watch for that's wrong right now",
     ops_only: true,
+    feature: None,
     run: |ctx| Box::pin(run(ctx)),
 };
 

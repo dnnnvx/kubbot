@@ -16,7 +16,7 @@ use tokio::signal::unix::{self, SignalKind};
 use tracing::{info, warn};
 
 use crate::cluster::Cluster;
-use crate::config::Config;
+use crate::config::{Config, Feature};
 use crate::health::Health;
 
 #[tokio::main(flavor = "current_thread")]
@@ -46,32 +46,40 @@ async fn main() -> anyhow::Result<()> {
     client.add_event_handler_context(cluster.clone());
     client.add_event_handler(handlers::on_invite);
     client.add_event_handler(handlers::on_message);
-    tokio::spawn(alerts::watch_ci(
-        client.clone(),
-        cluster.clone(),
-        config.tekton_forget_after,
-    ));
+    if cluster.enabled(Feature::Tekton) {
+        tokio::spawn(alerts::watch_ci(
+            client.clone(),
+            cluster.clone(),
+            config.tekton_forget_after,
+        ));
+    }
     let alerter = alerts::Alerter {
         client: client.clone(),
         ops_room: cluster.ops_room.clone(),
         repost_after: config.alert_repost_after,
     };
-    for reports in [cluster.policy_reports(), cluster.cluster_policy_reports()] {
-        let watch = alerter.clone().watch_problems(
-            reports,
-            watcher::Config::default(),
-            problems::policy_failures,
-        );
-        tokio::spawn(watch);
+    if cluster.enabled(Feature::Kyverno) {
+        for reports in [cluster.policy_reports(), cluster.cluster_policy_reports()] {
+            let watch = alerter.clone().watch_problems(
+                reports,
+                watcher::Config::default(),
+                problems::policy_failures,
+            );
+            tokio::spawn(watch);
+        }
     }
-    let reasons = cluster.pod_stuck_reasons.clone();
-    let unfinished = watcher::Config::default().fields(cluster::UNFINISHED_PODS);
-    tokio::spawn(
-        alerter.watch_problems(cluster.pods(), unfinished, move |pod| {
-            problems::stuck_containers(pod, &reasons)
-        }),
-    );
-    tokio::spawn(alerts::poll_tofu(client.clone(), cluster, config.tofu_poll));
+    if cluster.enabled(Feature::Pods) {
+        let reasons = cluster.pod_stuck_reasons.clone();
+        let unfinished = watcher::Config::default().fields(cluster::UNFINISHED_PODS);
+        tokio::spawn(
+            alerter.watch_problems(cluster.pods(), unfinished, move |pod| {
+                problems::stuck_containers(pod, &reasons)
+            }),
+        );
+    }
+    if cluster.enabled(Feature::Tofu) {
+        tokio::spawn(alerts::poll_tofu(client.clone(), cluster, config.tofu_poll));
+    }
     let user = client.user_id().context("no user ID after login")?;
     info!(%user, "ready");
 
