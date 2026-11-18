@@ -29,16 +29,6 @@ use crate::markdown::{code_block, tail};
 /// Enough for the error, short enough to read in a chat. An event caps at 65 KB.
 const MAX_LOG_BYTES: usize = 4_000;
 
-/// A problem that flaps, e.g. a flaky signature check or a crash loop, is posted at most once a day.
-const REPOST_AFTER: Duration = Duration::from_secs(24 * 3600);
-
-/// Waiting reasons of a container that won't get better by itself.
-const STUCK_REASONS: [&str; 3] = [
-    "CrashLoopBackOff",
-    "ImagePullBackOff",
-    "CreateContainerConfigError",
-];
-
 /// Watches forever. The watcher re-lists and retries by itself after an error.
 /// A run's start is posted, then edited into its result when it ends; a failure
 /// also gets a reply with the logs.
@@ -145,20 +135,23 @@ where
 }
 
 /// Watches forever, posting each problem `find` sees on an object once, when
-/// it shows up. Problems already there when the bot starts stay quiet.
+/// it shows up. Problems already there when the bot starts stay quiet, and one
+/// that flaps, e.g. a flaky signature check or a crash loop, is posted at most
+/// once per `repost_after`.
 pub async fn watch_problems<K>(
     client: Client,
     api: Api<K>,
     ops_room: OwnedRoomId,
-    find: fn(&K) -> Vec<Problem>,
+    repost_after: Duration,
+    find: impl Fn(&K) -> Vec<Problem>,
 ) where
     K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
 {
     let mut events = pin!(events(api));
     let mut problems = Problems::default();
     while let Some(event) = events.next().await {
-        problems.forget_posted_older_than(REPOST_AFTER);
-        for line in problems.change(&event, find) {
+        problems.forget_posted_older_than(repost_after);
+        for line in problems.change(&event, &find) {
             post(
                 &client,
                 &ops_room,
@@ -180,8 +173,8 @@ pub fn policy_failures(report: &DynamicObject) -> Vec<Problem> {
         .collect()
 }
 
-/// The containers of a pod that were OOM-killed or are stuck.
-pub fn stuck_containers(pod: &Pod) -> Vec<Problem> {
+/// The containers of a pod that were OOM-killed or wait for one of `reasons`.
+pub fn stuck_containers(pod: &Pod, reasons: &[String]) -> Vec<Problem> {
     let Some(status) = &pod.status else {
         return Vec::new();
     };
@@ -192,7 +185,7 @@ pub fn stuck_containers(pod: &Pod) -> Vec<Problem> {
     containers
         .chain(init_containers)
         .filter_map(|container| {
-            let reason = stuck_reason(container)?;
+            let reason = stuck_reason(container, reasons)?;
             let limit = match reason {
                 "OOMKilled" => memory_limit(pod, &container.name)
                     .map(|limit| format!(", memory limit `{limit}`"))
@@ -211,7 +204,7 @@ pub fn stuck_containers(pod: &Pod) -> Vec<Problem> {
 }
 
 /// An OOM kill wins: it's the cause of the crash loop that usually follows.
-fn stuck_reason(container: &ContainerStatus) -> Option<&str> {
+fn stuck_reason<'a>(container: &'a ContainerStatus, reasons: &[String]) -> Option<&'a str> {
     let oom_killed = [&container.state, &container.last_state]
         .iter()
         .filter_map(|state| state.as_ref()?.terminated.as_ref()?.reason.as_deref())
@@ -226,7 +219,10 @@ fn stuck_reason(container: &ContainerStatus) -> Option<&str> {
         .as_ref()?
         .reason
         .as_deref()?;
-    STUCK_REASONS.contains(&waiting).then_some(waiting)
+    reasons
+        .iter()
+        .any(|reason| reason == waiting)
+        .then_some(waiting)
 }
 
 fn memory_limit<'a>(pod: &'a Pod, container: &str) -> Option<&'a str> {
@@ -335,7 +331,7 @@ impl Problems {
     fn change<K: Resource>(
         &mut self,
         event: &watcher::Event<K>,
-        find: fn(&K) -> Vec<Problem>,
+        find: impl Fn(&K) -> Vec<Problem>,
     ) -> Vec<String> {
         let object = match event {
             watcher::Event::Init => return Vec::new(),
@@ -517,8 +513,9 @@ mod tests {
             }))
             .unwrap()
         };
+        let reasons = ["ImagePullBackOff".to_owned()];
         let lines = |pod: &Pod| -> Vec<String> {
-            stuck_containers(pod)
+            stuck_containers(pod, &reasons)
                 .into_iter()
                 .map(|problem| problem.line)
                 .collect()

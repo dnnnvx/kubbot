@@ -28,6 +28,10 @@ pub struct Config {
     pub tofu_poll: Duration,
     /// A CI run tracked this long is forgotten, in case its end was never seen.
     pub tekton_forget_after: Duration,
+    /// A Kyverno failure or stuck pod that flaps is posted at most once per this.
+    pub alert_repost_after: Duration,
+    /// Waiting reasons that make a container stuck. An OOM kill always counts.
+    pub pod_stuck_reasons: Vec<String>,
 }
 
 impl Config {
@@ -52,6 +56,11 @@ impl Config {
                 .context("OPS_ROOM must be a room ID")?,
             tofu_poll: Duration::from_secs(60 * positive("TOFU_POLL_MINUTES", 30)?),
             tekton_forget_after: Duration::from_secs(3600 * positive("TEKTON_GC_HOURS", 24)?),
+            alert_repost_after: Duration::from_secs(3600 * positive("ALERT_REPOST_HOURS", 24)?),
+            pod_stuck_reasons: list(
+                "POD_STUCK_REASONS",
+                "CrashLoopBackOff,ImagePullBackOff,CreateContainerConfigError",
+            )?,
         })
     }
 }
@@ -67,6 +76,17 @@ fn positive(name: &str, default: u64) -> anyhow::Result<u64> {
         .with_context(|| format!("{name} must be a whole number above 0"))
 }
 
+/// A comma-separated list, blanks dropped.
+fn list(name: &str, default: &str) -> anyhow::Result<Vec<String>> {
+    let value = var(name)?;
+    let items = value.as_deref().unwrap_or(default).split(',');
+    Ok(items
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 fn var(name: &str) -> anyhow::Result<Option<String>> {
     let file_var = format!("{name}_FILE");
     if let Ok(path) = env::var(&file_var) {
@@ -74,4 +94,15 @@ fn var(name: &str) -> anyhow::Result<Option<String>> {
         return Ok(Some(value.trim_end_matches(['\r', '\n']).to_owned()));
     }
     Ok(env::var(name).ok().filter(|v| !v.is_empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_lists_and_drops_blanks() {
+        let items = list("TEST_UNSET_LIST", " CrashLoopBackOff, ,ImagePullBackOff,").unwrap();
+        assert_eq!(items, ["CrashLoopBackOff", "ImagePullBackOff"]);
+    }
 }

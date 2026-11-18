@@ -17,6 +17,8 @@ It joins rooms it's invited to and answers `!commands` (`!help` lists them) as r
 | `OPS_ROOM` | yes | room ID, the only room where `!ci`, `!tofu` and `!kyverno` answer and where CI runs, tofu plans, policy failures and stuck pods are posted; use an encrypted, invite-only room |
 | `TOFU_POLL_MINUTES` | no (`30`) | how often the pending tofu plan is checked |
 | `TEKTON_GC_HOURS` | no (`24`) | a CI run still running after this long is forgotten, in case its end was missed |
+| `ALERT_REPOST_HOURS` | no (`24`) | a Kyverno failure or stuck pod that keeps coming back is posted at most once per this |
+| `POD_STUCK_REASONS` | no (`CrashLoopBackOff,ImagePullBackOff,CreateContainerConfigError`) | comma-separated container waiting reasons that get a pod posted; an OOM kill always does |
 | `RUST_LOG` | no | tracing filter, default `info,matrix_sdk=warn` |
 
 Any variable can instead be given as `<NAME>_FILE`, pointing at a file holding the value (for mounted secrets).
@@ -37,8 +39,8 @@ The bot talks to Kubernetes with the in-cluster service account, or the local ku
 - `!ci` lists PipelineRuns in `tekton-ci`, linking to the Tekton dashboard.
 - Each run's start is posted to `OPS_ROOM`, and the message is edited into the result when it ends; since clients usually don't notify on edits, a failure also gets a reply with the last log lines of the failed step. Runs that start and end while the bot is down aren't posted.
 - `!tofu` shows the pending plan of the `production` Terraform in `flux-system`, and the `kubectl` command to approve it. Applying is left to whoever runs that command. Every `TOFU_POLL_MINUTES`, a pending plan is posted the same way, as a reminder of the drift, once its readable text is stored.
-- `!kyverno` lists the `fail` results in Kyverno's PolicyReports and ClusterPolicyReports, which cover audit-mode policies and background scans. Each failure is also posted when it first shows up in a report: a background scan rewriting the same results stays quiet, a fixed failure that comes back is posted again. Failures already there when the bot starts aren't posted, and one that keeps flapping is posted at most once a day.
-- Containers that are OOM-killed, or stuck in `CrashLoopBackOff`, `ImagePullBackOff` or `CreateContainerConfigError`, are posted the same way, in any namespace, an OOM kill with the container's memory limit.
+- `!kyverno` lists the `fail` results in Kyverno's PolicyReports and ClusterPolicyReports, which cover audit-mode policies and background scans. Each failure is also posted when it first shows up in a report: a background scan rewriting the same results stays quiet, a fixed failure that comes back is posted again. Failures already there when the bot starts aren't posted, and one that keeps flapping is posted at most once per `ALERT_REPOST_HOURS`.
+- Containers that are OOM-killed, or waiting for one of `POD_STUCK_REASONS`, are posted the same way, in any namespace, an OOM kill with the container's memory limit.
 
 The service account needs, in `tekton-ci`: `get`, `list`, `watch` on `pipelineruns`, `list` on `taskruns`, `get` on `pods/log`; in `flux-system`: `get` on `terraforms` and `configmaps`; cluster-wide: `list`, `watch` on `pods`, and on `policyreports` and `clusterpolicyreports` (`wgpolicyk8s.io`).
 Failure logs are posted as they are: a step that prints a secret puts it in the room's history.
