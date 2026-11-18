@@ -1,13 +1,17 @@
 //! Posts CI runs, pending tofu plans and Kyverno policy failures to the ops room.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
+use std::future;
 use std::pin::pin;
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
-use kube::Api;
+use futures_util::{Stream, StreamExt};
+use k8s_openapi::serde::de::DeserializeOwned;
 use kube::api::DynamicObject;
 use kube::runtime::{WatchStreamExt, watcher};
+use kube::{Api, Resource};
 use matrix_sdk::Client;
 use matrix_sdk::ruma::events::relation::Reply;
 use matrix_sdk::ruma::events::room::message::{
@@ -17,32 +21,23 @@ use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, RoomId};
 use tracing::{error, warn};
 
 use crate::cluster::{Cluster, RunState, run_link, run_name, run_state};
-use crate::commands::kyverno::{self, Failure};
+use crate::commands::kyverno;
 use crate::commands::tofu::Plan;
 use crate::markdown::{code_block, tail};
 
 /// Enough for the error, short enough to read in a chat. An event caps at 65 KB.
 const MAX_LOG_BYTES: usize = 4_000;
 
-/// A policy failure that flaps, e.g. a flaky signature check, is posted at most once a day.
+/// A problem that flaps, e.g. a flaky signature check, is posted at most once a day.
 const REPOST_AFTER: Duration = Duration::from_secs(24 * 3600);
 
 /// Watches forever. The watcher re-lists and retries by itself after an error.
 /// A run's start is posted, then edited into its result when it ends; a failure
 /// also gets a reply with the logs.
 pub async fn watch_ci(client: Client, cluster: Cluster, forget_after: Duration) {
-    let events =
-        watcher::watcher(cluster.pipeline_runs(), watcher::Config::default()).default_backoff();
-    let mut events = pin!(events);
+    let mut events = pin!(events(cluster.pipeline_runs()));
     let mut running = Running::default();
     while let Some(event) = events.next().await {
-        let event = match event {
-            Ok(event) => event,
-            Err(err) => {
-                warn!("watching PipelineRuns failed: {err:#}");
-                continue;
-            }
-        };
         running.forget_older_than(forget_after);
         match running.change(&event) {
             None => {}
@@ -124,31 +119,57 @@ pub async fn poll_tofu(client: Client, cluster: Cluster, every: Duration) {
     }
 }
 
-/// Watches forever, posting each policy failure once, when it first shows up
-/// in a report. Failures already there when the bot starts stay quiet.
-pub async fn watch_kyverno(client: Client, reports: Api<DynamicObject>, ops_room: OwnedRoomId) {
-    let events = watcher::watcher(reports, watcher::Config::default()).default_backoff();
-    let mut events = pin!(events);
-    let mut failing = Failing::default();
+/// A watch's events, forever. The watcher re-lists and retries by itself; errors are only logged.
+fn events<K>(api: Api<K>) -> impl Stream<Item = watcher::Event<K>>
+where
+    K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
+{
+    let url = api.resource_url().to_owned();
+    watcher::watcher(api, watcher::Config::default())
+        .default_backoff()
+        .filter_map(move |event| {
+            future::ready(
+                event
+                    .inspect_err(|err| warn!("watching {url} failed: {err:#}"))
+                    .ok(),
+            )
+        })
+}
+
+/// Watches forever, posting each problem `find` sees on an object once, when
+/// it shows up. Problems already there when the bot starts stay quiet.
+pub async fn watch_problems<K>(
+    client: Client,
+    api: Api<K>,
+    ops_room: OwnedRoomId,
+    find: fn(&K) -> Vec<Problem>,
+) where
+    K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
+{
+    let mut events = pin!(events(api));
+    let mut problems = Problems::default();
     while let Some(event) = events.next().await {
-        failing.forget_posted_older_than(REPOST_AFTER);
-        let event = match event {
-            Ok(event) => event,
-            Err(err) => {
-                warn!("watching PolicyReports failed: {err:#}");
-                continue;
-            }
-        };
-        for line in failing.change(&event) {
-            let text = format!("🛡️ **Kyverno:** {line}");
+        problems.forget_posted_older_than(REPOST_AFTER);
+        for line in problems.change(&event, find) {
             post(
                 &client,
                 &ops_room,
-                RoomMessageEventContent::text_markdown(text),
+                RoomMessageEventContent::text_markdown(line),
             )
             .await;
         }
     }
+}
+
+/// The failing policies of a PolicyReport.
+pub fn policy_failures(report: &DynamicObject) -> Vec<Problem> {
+    kyverno::failures(report)
+        .iter()
+        .map(|failure| Problem {
+            key: format!("{}/{}", failure.policy, failure.rule),
+            line: format!("🛡️ **Kyverno:** {}", failure.line()),
+        })
+        .collect()
 }
 
 /// Sends to the ops room. The event ID is what a later edit refers to.
@@ -221,59 +242,70 @@ impl Running {
     }
 }
 
-/// The `(policy, rule)` pairs failing in each report, by report UID. Kyverno
-/// rewrites reports at every background scan, so only a pair a report didn't
-/// have before is new.
-/// shortcut: reports deleted while the watch is down are never forgotten, harmless until churn is huge.
-#[derive(Default)]
-struct Failing {
-    reports: HashMap<String, HashSet<(String, String)>>,
-    /// Set once the first listing is done: before that, failures are only recorded.
-    listed: bool,
-    /// When each `(report UID, policy, rule)` was last posted, so a flapping one stays quiet.
-    posted: HashMap<(String, String, String), Instant>,
+/// Something wrong with an object, as `find` sees it.
+pub struct Problem {
+    /// Tells it apart from the object's other problems, e.g. the policy and rule.
+    key: String,
+    line: String,
 }
 
-impl Failing {
-    /// The failures to post: new in a report, after the first listing, not posted lately.
-    fn change(&mut self, event: &watcher::Event<DynamicObject>) -> Vec<String> {
-        let report = match event {
+/// The problems of each object, by UID, to post only the ones it didn't have
+/// before: objects are rewritten often, e.g. Kyverno's reports at every scan.
+/// shortcut: objects deleted while the watch is down are never forgotten, harmless until churn is huge.
+#[derive(Default)]
+struct Problems {
+    keys: HashMap<String, HashSet<String>>,
+    /// Set once the first listing is done: before that, problems are only recorded.
+    listed: bool,
+    /// When each `(UID, key)` was first posted, so a flapping problem stays quiet.
+    posted: HashMap<(String, String), Instant>,
+}
+
+impl Problems {
+    /// The lines to post: problems new on an object, after the first listing, not posted lately.
+    fn change<K: Resource>(
+        &mut self,
+        event: &watcher::Event<K>,
+        find: fn(&K) -> Vec<Problem>,
+    ) -> Vec<String> {
+        let object = match event {
             watcher::Event::Init => return Vec::new(),
             watcher::Event::InitDone => {
                 self.listed = true;
                 return Vec::new();
             }
-            watcher::Event::Delete(report) => {
-                if let Some(uid) = report.metadata.uid.as_deref() {
-                    self.reports.remove(uid);
+            watcher::Event::Delete(object) => {
+                if let Some(uid) = object.meta().uid.as_deref() {
+                    self.keys.remove(uid);
                 }
                 return Vec::new();
             }
-            // A re-list after a watch error diffs too, catching what failed meanwhile.
-            watcher::Event::InitApply(report) | watcher::Event::Apply(report) => report,
+            // A re-list after a watch error diffs too, catching what broke meanwhile.
+            watcher::Event::InitApply(object) | watcher::Event::Apply(object) => object,
         };
-        let Some(uid) = report.metadata.uid.clone() else {
+        let Some(uid) = object.meta().uid.clone() else {
             return Vec::new();
         };
-        let key = |failure: &Failure| (failure.policy.to_owned(), failure.rule.to_owned());
-        let failures = kyverno::failures(report);
-        let now = failures.iter().map(key).collect();
-        let before = self.reports.insert(uid.clone(), now).unwrap_or_default();
+        let problems = find(object);
+        let now = problems.iter().map(|problem| problem.key.clone()).collect();
+        let before = self.keys.insert(uid.clone(), now).unwrap_or_default();
         if !self.listed {
             return Vec::new();
         }
-        failures
-            .iter()
-            .filter(|failure| !before.contains(&key(failure)))
-            .filter(|failure| {
-                let (policy, rule) = key(failure);
-                let posted = (uid.clone(), policy, rule);
-                // Keeps the first post's time, so a steady flapper is reposted daily.
-                let fresh = !self.posted.contains_key(&posted);
-                self.posted.entry(posted).or_insert_with(Instant::now);
-                fresh
-            })
-            .map(Failure::line)
+        problems
+            .into_iter()
+            .filter(|problem| !before.contains(&problem.key))
+            // Keeps the first post's time, so a steady flapper is reposted daily.
+            .filter(
+                |problem| match self.posted.entry((uid.clone(), problem.key.clone())) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(Instant::now());
+                        true
+                    }
+                    Entry::Occupied(_) => false,
+                },
+            )
+            .map(|problem| problem.line)
             .collect()
     }
 
@@ -363,41 +395,41 @@ mod tests {
         use crate::commands::kyverno::test_report;
 
         let fail = |policy: &str| json!({ "policy": policy, "rule": policy, "result": "fail", "message": "no" });
-        let mut failing = Failing::default();
+        let mut problems = Problems::default();
+        let mut change = |event| problems.change(&event, policy_failures);
 
         // Failing before the bot started: quiet.
-        let old = watcher::Event::InitApply(test_report("a", &json!([fail("signed")])));
-        assert!(failing.change(&old).is_empty());
-        assert!(failing.change(&watcher::Event::InitDone).is_empty());
+        let report = |results| test_report("a", &json!(results));
+        assert!(change(watcher::Event::InitApply(report(vec![fail("signed")]))).is_empty());
+        assert!(change(watcher::Event::InitDone).is_empty());
 
         // A background scan rewrites the same results: quiet. A new failure: posted.
-        assert!(
-            failing
-                .change(&watcher::Event::Apply(test_report(
-                    "a",
-                    &json!([fail("signed")])
-                )))
-                .is_empty()
-        );
-        let both = test_report("a", &json!([fail("signed"), fail("labels")]));
-        let posted = failing.change(&watcher::Event::Apply(both));
+        assert!(change(watcher::Event::Apply(report(vec![fail("signed")]))).is_empty());
+        let posted = change(watcher::Event::Apply(report(vec![
+            fail("signed"),
+            fail("labels"),
+        ])));
         assert_eq!(posted.len(), 1);
-        assert!(posted[0].starts_with("`labels` on ReplicaSet"));
+        assert!(posted[0].starts_with("🛡️ **Kyverno:** `labels` on ReplicaSet"));
 
         // Fixed then broken again: posted again. A re-list catches what failed meanwhile.
-        failing.change(&watcher::Event::Apply(test_report("a", &json!([]))));
-        let again = watcher::Event::InitApply(test_report("a", &json!([fail("signed")])));
-        assert_eq!(failing.change(&again).len(), 1);
+        change(watcher::Event::Apply(report(vec![])));
+        assert_eq!(
+            change(watcher::Event::InitApply(report(vec![fail("signed")]))).len(),
+            1
+        );
 
         // Flapping again soon after: quiet, until the last post is forgotten.
-        failing.change(&watcher::Event::Apply(test_report("a", &json!([]))));
-        assert!(failing.change(&again).is_empty());
-        failing.change(&watcher::Event::Apply(test_report("a", &json!([]))));
-        failing.forget_posted_older_than(Duration::ZERO);
-        assert_eq!(failing.change(&again).len(), 1);
+        change(watcher::Event::Apply(report(vec![])));
+        assert!(change(watcher::Event::Apply(report(vec![fail("signed")]))).is_empty());
+        change(watcher::Event::Apply(report(vec![])));
+        problems.forget_posted_older_than(Duration::ZERO);
+        let again = watcher::Event::Apply(report(vec![fail("signed")]));
+        assert_eq!(problems.change(&again, policy_failures).len(), 1);
 
-        failing.change(&watcher::Event::Delete(test_report("a", &json!([]))));
-        assert!(failing.reports.is_empty());
+        let deleted = watcher::Event::Delete(report(vec![]));
+        problems.change(&deleted, policy_failures);
+        assert!(problems.keys.is_empty());
     }
 
     #[test]
