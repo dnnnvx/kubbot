@@ -29,16 +29,19 @@ use crate::markdown::{code_block, tail};
 /// Enough for the error, short enough to read in a chat. An event caps at 65 KB.
 const MAX_LOG_BYTES: usize = 4_000;
 
+/// Where the tracked runs are kept across restarts, in the bot's store.
+const RUNNING_KEY: &[u8] = b"tekton.running";
+
 /// Watches forever. The watcher re-lists and retries by itself after an error.
 /// A run's start is posted, then edited into its result when it ends; a failure
 /// also gets a reply with the logs.
 pub async fn watch_ci(client: Client, cluster: Cluster, forget_after: Duration) {
     let mut events = pin!(events(cluster.pipeline_runs()));
-    let mut running = Running::default();
+    let mut running = Running::load(&client).await;
     while let Some(event) = events.next().await {
         running.forget_older_than(forget_after);
         match running.change(&event) {
-            None => {}
+            None => continue,
             Some(Change::Started(run)) => {
                 let text = message(&cluster.dashboard_url, run, None);
                 let sent = post(
@@ -51,6 +54,7 @@ pub async fn watch_ci(client: Client, cluster: Cluster, forget_after: Duration) 
             }
             Some(Change::Ended(run, started)) => post_end(&client, &cluster, run, started).await,
         }
+        running.save(&client).await;
     }
 }
 
@@ -256,7 +260,9 @@ async fn post(
     }
 }
 
-/// The runs whose start was posted and whose end wasn't yet, by UID.
+/// The runs whose start was posted and whose end wasn't yet, by UID. Kept
+/// across restarts, so a run that outlives the bot, e.g. the bot's own
+/// release, gets its start message edited instead of a second one.
 /// shortcut: a run that starts and ends while the bot is down or disconnected is never posted.
 #[derive(Default)]
 struct Running(HashMap<String, Tracked>);
@@ -274,6 +280,37 @@ enum Change<'a> {
 }
 
 impl Running {
+    async fn load(client: &Client) -> Self {
+        let started = stored_runs(client).await.unwrap_or_else(|err| {
+            warn!("loading the tracked runs failed: {err:#}");
+            HashMap::new()
+        });
+        // The age restarts: a run deleted while the bot was down is forgotten a full `forget_after` later.
+        let since = Instant::now();
+        let tracked = started.into_iter().map(|(uid, started)| {
+            let started = Some(started);
+            (uid, Tracked { started, since })
+        });
+        Self(tracked.collect())
+    }
+
+    /// Only runs with a start message: one whose start failed to post is posted again after a restart.
+    async fn save(&self, client: &Client) {
+        let started: HashMap<&str, &OwnedEventId> = self
+            .0
+            .iter()
+            .filter_map(|(uid, tracked)| Some((uid.as_str(), tracked.started.as_ref()?)))
+            .collect();
+        let bytes = serde_json::to_vec(&started).expect("a map of strings serializes");
+        let saved = client
+            .state_store()
+            .set_custom_value(RUNNING_KEY, bytes)
+            .await;
+        if let Err(err) = saved {
+            warn!("saving the tracked runs failed: {err:#}");
+        }
+    }
+
     fn change<'a>(&mut self, event: &'a watcher::Event<DynamicObject>) -> Option<Change<'a>> {
         let run = match event {
             watcher::Event::Init | watcher::Event::InitDone => return None,
@@ -379,6 +416,13 @@ impl Problems {
     }
 }
 
+async fn stored_runs(client: &Client) -> anyhow::Result<HashMap<String, OwnedEventId>> {
+    let Some(bytes) = client.state_store().get_custom_value(RUNNING_KEY).await? else {
+        return Ok(HashMap::new());
+    };
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 fn message(dashboard_url: &str, run: &DynamicObject, logs: Option<&str>) -> String {
     let link = run_link(dashboard_url, run);
     let failed = match run_state(run) {
@@ -432,6 +476,30 @@ mod tests {
         assert_eq!(id, event_id());
         assert!(running.change(&watcher::Event::Apply(done())).is_none());
         assert!(running.0.is_empty(), "ended runs are forgotten");
+    }
+
+    #[tokio::test]
+    async fn keeps_tracked_runs_across_restarts() {
+        let client = Client::builder()
+            .homeserver_url("http://localhost")
+            .build()
+            .await
+            .unwrap();
+        let mut running = Running::load(&client).await;
+        running.track(&test_run("a", "Unknown", "Running"), Some(event_id()));
+        running.track(&test_run("b", "Unknown", "Running"), None);
+        running.save(&client).await;
+
+        // After a restart: still running is quiet, the end edits the old start message.
+        let mut running = Running::load(&client).await;
+        let event = watcher::Event::InitApply(test_run("a", "Unknown", "Running"));
+        assert!(running.change(&event).is_none());
+        let event = watcher::Event::Apply(test_run("a", "True", "Succeeded"));
+        let Some(Change::Ended(_, Some(id))) = running.change(&event) else {
+            panic!("end not posted as an edit");
+        };
+        assert_eq!(id, event_id());
+        assert!(running.0.is_empty(), "a run whose start failed isn't kept");
     }
 
     #[test]
