@@ -39,9 +39,8 @@ impl Plan {
             .get(name)
             .await?;
 
-        // tofu-controller's name for the plan of the `default` workspace.
         let stored = Api::<ConfigMap>::namespaced(cluster.kube.clone(), namespace)
-            .get_opt(&format!("tfplan-default-{name}"))
+            .get_opt(&plan_config_map(name))
             .await?;
         let kubectl_context = cluster.kubectl_context.clone();
         Ok(Self {
@@ -89,6 +88,7 @@ impl Plan {
             return Ok(reply);
         };
         write!(reply, "\n\n**Pending:** `{pending}`")?;
+        let kubectl = format!("kubectl --context {} -n {namespace}", self.kubectl_context);
 
         let saved = self.saved();
         let text = self
@@ -100,7 +100,15 @@ impl Plan {
             Some(text) if saved == Some(pending) => {
                 write!(reply, "\n\n{}", code_block(head(text, MAX_PLAN_BYTES)))?;
                 if text.len() > MAX_PLAN_BYTES {
-                    reply.push_str("\n\nPlan cut short, see `just tofu-plans` for the rest.");
+                    let full = format!(
+                        "{kubectl} get configmap {} -o jsonpath='{{.data.tfplan}}'",
+                        plan_config_map(name)
+                    );
+                    write!(
+                        reply,
+                        "\n\nPlan cut short, the full one:\n\n{}",
+                        code_block(&full)
+                    )?;
                 }
             }
             Some(_) => write!(
@@ -113,13 +121,16 @@ impl Plan {
 
         let patch = format!(r#"{{"spec":{{"approvePlan":"{pending}"}}}}"#);
         let apply = format!(
-            "kubectl --context {} -n {namespace} patch terraform {name} \
-             --type merge --field-manager tofu-approve -p '{patch}'",
-            self.kubectl_context
+            "{kubectl} patch terraform {name} --type merge --field-manager tofu-approve -p '{patch}'"
         );
         write!(reply, "\n\nApply with:\n\n{}", code_block(&apply))?;
         Ok(reply)
     }
+}
+
+/// tofu-controller's name for the ConfigMap holding the plan of the `default` workspace.
+fn plan_config_map(terraform: &str) -> String {
+    format!("tfplan-default-{terraform}")
 }
 
 #[cfg(test)]
@@ -203,7 +214,10 @@ mod tests {
     fn cuts_long_plans_on_a_character_boundary() {
         let stored = stored("plan-main-new", &"é".repeat(MAX_PLAN_BYTES));
         let reply = plan("plan-main-new", stored).render().unwrap();
-        assert!(reply.contains("Plan cut short"));
+        assert!(reply.contains(
+            "kubectl --context homelab -n flux-system get configmap tfplan-default-production \
+             -o jsonpath='{.data.tfplan}'"
+        ));
         assert!(reply.len() < MAX_PLAN_BYTES + 1000);
     }
 }
