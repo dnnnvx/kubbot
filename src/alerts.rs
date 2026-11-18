@@ -3,9 +3,9 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::future;
 use std::pin::pin;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use std::{future, mem};
 
 use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
@@ -19,6 +19,7 @@ use matrix_sdk::ruma::events::room::message::{
     Relation, ReplacementMetadata, RoomMessageEventContent,
 };
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, RoomId};
+use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
 use crate::cluster::{Cluster, RunState, run_link, run_name, run_state};
@@ -30,7 +31,7 @@ use crate::markdown::{code_block, tail};
 const MAX_LOG_BYTES: usize = 4_000;
 
 /// Where the tracked runs are kept across restarts, in the bot's store.
-const RUNNING_KEY: &[u8] = b"tekton.running";
+const RUNNING_KEY: &str = "tekton.running";
 
 /// Watches forever. The watcher re-lists and retries by itself after an error.
 /// A run's start is posted, then edited into its result when it ends; a failure
@@ -151,8 +152,9 @@ pub async fn watch_problems<K>(
 ) where
     K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
 {
+    let key = format!("tekton.problems{}", api.resource_url());
+    let mut problems = Problems::load(&client, &key).await;
     let mut events = pin!(events(api));
-    let mut problems = Problems::default();
     while let Some(event) = events.next().await {
         problems.forget_posted_older_than(repost_after);
         for line in problems.change(&event, &find) {
@@ -162,6 +164,9 @@ pub async fn watch_problems<K>(
                 RoomMessageEventContent::text_markdown(line),
             )
             .await;
+        }
+        if mem::take(&mut problems.changed) {
+            save(&client, &key, &problems).await;
         }
     }
 }
@@ -281,10 +286,8 @@ enum Change<'a> {
 
 impl Running {
     async fn load(client: &Client) -> Self {
-        let started = stored_runs(client).await.unwrap_or_else(|err| {
-            warn!("loading the tracked runs failed: {err:#}");
-            HashMap::new()
-        });
+        let started: HashMap<String, OwnedEventId> =
+            load(client, RUNNING_KEY).await.unwrap_or_default();
         // The age restarts: a run deleted while the bot was down is forgotten a full `forget_after` later.
         let since = Instant::now();
         let tracked = started.into_iter().map(|(uid, started)| {
@@ -301,14 +304,7 @@ impl Running {
             .iter()
             .filter_map(|(uid, tracked)| Some((uid.as_str(), tracked.started.as_ref()?)))
             .collect();
-        let bytes = serde_json::to_vec(&started).expect("a map of strings serializes");
-        let saved = client
-            .state_store()
-            .set_custom_value(RUNNING_KEY, bytes)
-            .await;
-        if let Err(err) = saved {
-            warn!("saving the tracked runs failed: {err:#}");
-        }
+        save(client, RUNNING_KEY, &started).await;
     }
 
     fn change<'a>(&mut self, event: &'a watcher::Event<DynamicObject>) -> Option<Change<'a>> {
@@ -351,76 +347,144 @@ pub struct Problem {
     line: String,
 }
 
-/// The problems of each object, by UID, to post only the ones it didn't have
-/// before: objects are rewritten often, e.g. Kyverno's reports at every scan.
-/// shortcut: objects deleted while the watch is down are never forgotten, harmless until churn is huge.
-#[derive(Default)]
+/// The problems of each object, to post only the ones it didn't have before:
+/// objects are rewritten often, e.g. Kyverno's reports at every scan. Kept
+/// across restarts, so what broke while the bot was down is posted, and a
+/// restart neither reposts nor forgets what was posted lately.
+#[derive(Default, Serialize, Deserialize)]
 struct Problems {
+    /// The keys of each object's problems, by UID. Objects without any aren't
+    /// kept, so healthy ones cost nothing and their updates never save.
     keys: HashMap<String, HashSet<String>>,
-    /// Set once the first listing is done: before that, problems are only recorded.
+    /// When each problem was first posted, by UID then key, so a flapping one stays quiet.
+    posted: HashMap<String, HashMap<String, SystemTime>>,
+    /// Set once a listing is done, or something was saved before: until then, problems are only recorded.
+    #[serde(skip)]
     listed: bool,
-    /// When each `(UID, key)` was first posted, so a flapping problem stays quiet.
-    posted: HashMap<(String, String), Instant>,
+    /// The objects of the listing in progress: the ones missing from it were deleted meanwhile.
+    #[serde(skip)]
+    listing: HashSet<String>,
+    /// Something to save since the last save.
+    #[serde(skip)]
+    changed: bool,
 }
 
 impl Problems {
-    /// The lines to post: problems new on an object, after the first listing, not posted lately.
+    /// Nothing saved means a first start: what's already broken stays quiet.
+    async fn load(client: &Client, key: &str) -> Self {
+        let Some(saved) = load::<Self>(client, key).await else {
+            return Self::default();
+        };
+        Self {
+            listed: true,
+            ..saved
+        }
+    }
+
+    /// The lines to post: problems new on an object, once listed, not posted lately.
     fn change<K: Resource>(
         &mut self,
         event: &watcher::Event<K>,
         find: impl Fn(&K) -> Vec<Problem>,
     ) -> Vec<String> {
         let object = match event {
-            watcher::Event::Init => return Vec::new(),
+            watcher::Event::Init => {
+                self.listing.clear();
+                return Vec::new();
+            }
             watcher::Event::InitDone => {
                 self.listed = true;
+                let listing = mem::take(&mut self.listing);
+                let before = self.keys.len();
+                self.keys.retain(|uid, _| listing.contains(uid));
+                self.changed |= self.keys.len() != before;
                 return Vec::new();
             }
             watcher::Event::Delete(object) => {
                 if let Some(uid) = object.meta().uid.as_deref() {
-                    self.keys.remove(uid);
+                    self.changed |= self.keys.remove(uid).is_some();
                 }
                 return Vec::new();
             }
-            // A re-list after a watch error diffs too, catching what broke meanwhile.
+            // A re-list, after a restart or a watch error, diffs too, catching what broke meanwhile.
             watcher::Event::InitApply(object) | watcher::Event::Apply(object) => object,
         };
         let Some(uid) = object.meta().uid.clone() else {
             return Vec::new();
         };
+        if matches!(event, watcher::Event::InitApply(_)) {
+            self.listing.insert(uid.clone());
+        }
         let problems = find(object);
-        let now = problems.iter().map(|problem| problem.key.clone()).collect();
-        let before = self.keys.insert(uid.clone(), now).unwrap_or_default();
+        let now: HashSet<String> = problems.iter().map(|problem| problem.key.clone()).collect();
+        let before = self.keys.remove(&uid).unwrap_or_default();
+        self.changed |= before != now;
+        if !now.is_empty() {
+            self.keys.insert(uid.clone(), now);
+        }
         if !self.listed {
             return Vec::new();
         }
-        problems
+        let posted = self.posted.entry(uid).or_default();
+        let lines: Vec<String> = problems
             .into_iter()
             .filter(|problem| !before.contains(&problem.key))
-            // Keeps the first post's time, so a steady flapper is reposted daily.
-            .filter(
-                |problem| match self.posted.entry((uid.clone(), problem.key.clone())) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(Instant::now());
-                        true
-                    }
-                    Entry::Occupied(_) => false,
-                },
-            )
+            // Keeps the first post's time, so a steady flapper is reposted once per window.
+            .filter(|problem| match posted.entry(problem.key.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(SystemTime::now());
+                    true
+                }
+                Entry::Occupied(_) => false,
+            })
             .map(|problem| problem.line)
-            .collect()
+            .collect();
+        self.changed |= !lines.is_empty();
+        lines
     }
 
     fn forget_posted_older_than(&mut self, age: Duration) {
-        self.posted.retain(|_, posted| posted.elapsed() < age);
+        let count = |posted: &HashMap<String, HashMap<String, SystemTime>>| {
+            posted.values().map(HashMap::len).sum::<usize>()
+        };
+        let before = count(&self.posted);
+        for posted in self.posted.values_mut() {
+            // A clock set back makes `elapsed` fail: kept, as if just posted.
+            posted.retain(|_, at| at.elapsed().map_or(true, |elapsed| elapsed < age));
+        }
+        self.posted.retain(|_, posted| !posted.is_empty());
+        self.changed |= count(&self.posted) != before;
     }
 }
 
-async fn stored_runs(client: &Client) -> anyhow::Result<HashMap<String, OwnedEventId>> {
-    let Some(bytes) = client.state_store().get_custom_value(RUNNING_KEY).await? else {
-        return Ok(HashMap::new());
+/// A value kept in the bot's store across restarts. Missing or unreadable, e.g. from an older version, is `None`.
+async fn load<T: DeserializeOwned>(client: &Client, key: &str) -> Option<T> {
+    let loaded = async {
+        let bytes = client
+            .state_store()
+            .get_custom_value(key.as_bytes())
+            .await?;
+        anyhow::Ok(
+            bytes
+                .map(|bytes| serde_json::from_slice(&bytes))
+                .transpose()?,
+        )
     };
-    Ok(serde_json::from_slice(&bytes)?)
+    loaded.await.unwrap_or_else(|err| {
+        warn!(key, "loading from the store failed: {err:#}");
+        None
+    })
+}
+
+async fn save<T: Serialize>(client: &Client, key: &str, value: &T) {
+    let bytes = serde_json::to_vec(value).expect("maps with string keys serialize");
+    let saved = client
+        .state_store()
+        .set_custom_value(key.as_bytes(), bytes)
+        .await;
+    if let Err(err) = saved {
+        warn!(key, "saving to the store failed: {err:#}");
+    }
 }
 
 fn message(dashboard_url: &str, run: &DynamicObject, logs: Option<&str>) -> String {
@@ -500,6 +564,11 @@ mod tests {
         };
         assert_eq!(id, event_id());
         assert!(running.0.is_empty(), "a run whose start failed isn't kept");
+
+        // Alerts: nothing saved is a first start and stays quiet, anything saved diffs.
+        assert!(!Problems::load(&client, "problems").await.listed);
+        save(&client, "problems", &Problems::default()).await;
+        assert!(Problems::load(&client, "problems").await.listed);
     }
 
     #[test]
@@ -563,6 +632,55 @@ mod tests {
         let deleted = watcher::Event::Delete(report(vec![]));
         problems.change(&deleted, policy_failures);
         assert!(problems.keys.is_empty());
+    }
+
+    #[test]
+    fn diffs_against_what_was_saved_before_a_restart() {
+        use serde_json::json;
+
+        use crate::commands::kyverno::test_report;
+
+        let fail = |policy: &str| json!({ "policy": policy, "rule": policy, "result": "fail", "message": "no" });
+        let report = |uid, results| test_report(uid, &json!(results));
+        let mut problems = Problems {
+            listed: true,
+            ..Problems::default()
+        };
+        let event = watcher::Event::Apply(report("a", vec![fail("signed")]));
+        assert_eq!(problems.change(&event, policy_failures).len(), 1);
+        assert!(problems.changed, "a post is saved");
+        let healthy = watcher::Event::Apply(report("b", vec![]));
+        problems.changed = false;
+        problems.change(&healthy, policy_failures);
+        assert!(!problems.changed, "a healthy object isn't saved");
+        assert_eq!(problems.keys.len(), 1);
+
+        // Restarted: the saved state comes back as if listed.
+        let saved = serde_json::to_vec(&problems).unwrap();
+        let mut problems = Problems {
+            listed: true,
+            ..serde_json::from_slice(&saved).unwrap()
+        };
+        let mut change = |event| problems.change(&event, policy_failures);
+        assert!(change(watcher::Event::Init).is_empty());
+        // Still failing: quiet. Broke while the bot was down: posted.
+        assert!(change(watcher::Event::InitApply(report("a", vec![fail("signed")]))).is_empty());
+        assert_eq!(
+            change(watcher::Event::InitApply(report("c", vec![fail("labels")]))).len(),
+            1
+        );
+        assert!(change(watcher::Event::InitDone).is_empty());
+
+        // Deleted while the bot was down: dropped once the listing is done.
+        let event = watcher::Event::InitApply(report("a", vec![fail("signed")]));
+        assert!(
+            problems
+                .change(&watcher::Event::Init, policy_failures)
+                .is_empty()
+        );
+        problems.change(&event, policy_failures);
+        problems.change(&watcher::Event::InitDone, policy_failures);
+        assert_eq!(problems.keys.keys().collect::<Vec<_>>(), ["a"]);
     }
 
     #[test]

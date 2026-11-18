@@ -4004,6 +4004,7 @@ dependencies = [
  "libsqlite3-sys",
  "matrix-sdk",
  "matrix-sdk-store-encryption",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
