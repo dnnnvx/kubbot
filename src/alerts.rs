@@ -24,6 +24,9 @@ use crate::markdown::{code_block, tail};
 /// Enough for the error, short enough to read in a chat. An event caps at 65 KB.
 const MAX_LOG_BYTES: usize = 4_000;
 
+/// A policy failure that flaps, e.g. a flaky signature check, is posted at most once a day.
+const REPOST_AFTER: Duration = Duration::from_secs(24 * 3600);
+
 /// Watches forever. The watcher re-lists and retries by itself after an error.
 /// A run's start is posted, then edited into its result when it ends; a failure
 /// also gets a reply with the logs.
@@ -128,6 +131,7 @@ pub async fn watch_kyverno(client: Client, reports: Api<DynamicObject>, ops_room
     let mut events = pin!(events);
     let mut failing = Failing::default();
     while let Some(event) = events.next().await {
+        failing.forget_posted_older_than(REPOST_AFTER);
         let event = match event {
             Ok(event) => event,
             Err(err) => {
@@ -226,10 +230,12 @@ struct Failing {
     reports: HashMap<String, HashSet<(String, String)>>,
     /// Set once the first listing is done: before that, failures are only recorded.
     listed: bool,
+    /// When each `(report UID, policy, rule)` was last posted, so a flapping one stays quiet.
+    posted: HashMap<(String, String, String), Instant>,
 }
 
 impl Failing {
-    /// The failures to post: new in a report, after the first listing.
+    /// The failures to post: new in a report, after the first listing, not posted lately.
     fn change(&mut self, event: &watcher::Event<DynamicObject>) -> Vec<String> {
         let report = match event {
             watcher::Event::Init => return Vec::new(),
@@ -252,15 +258,27 @@ impl Failing {
         let key = |failure: &Failure| (failure.policy.to_owned(), failure.rule.to_owned());
         let failures = kyverno::failures(report);
         let now = failures.iter().map(key).collect();
-        let before = self.reports.insert(uid, now).unwrap_or_default();
+        let before = self.reports.insert(uid.clone(), now).unwrap_or_default();
         if !self.listed {
             return Vec::new();
         }
         failures
             .iter()
             .filter(|failure| !before.contains(&key(failure)))
+            .filter(|failure| {
+                let (policy, rule) = key(failure);
+                let posted = (uid.clone(), policy, rule);
+                // Keeps the first post's time, so a steady flapper is reposted daily.
+                let fresh = !self.posted.contains_key(&posted);
+                self.posted.entry(posted).or_insert_with(Instant::now);
+                fresh
+            })
             .map(Failure::line)
             .collect()
+    }
+
+    fn forget_posted_older_than(&mut self, age: Duration) {
+        self.posted.retain(|_, posted| posted.elapsed() < age);
     }
 }
 
@@ -369,6 +387,13 @@ mod tests {
         // Fixed then broken again: posted again. A re-list catches what failed meanwhile.
         failing.change(&watcher::Event::Apply(test_report("a", &json!([]))));
         let again = watcher::Event::InitApply(test_report("a", &json!([fail("signed")])));
+        assert_eq!(failing.change(&again).len(), 1);
+
+        // Flapping again soon after: quiet, until the last post is forgotten.
+        failing.change(&watcher::Event::Apply(test_report("a", &json!([]))));
+        assert!(failing.change(&again).is_empty());
+        failing.change(&watcher::Event::Apply(test_report("a", &json!([]))));
+        failing.forget_posted_older_than(Duration::ZERO);
         assert_eq!(failing.change(&again).len(), 1);
 
         failing.change(&watcher::Event::Delete(test_report("a", &json!([]))));
