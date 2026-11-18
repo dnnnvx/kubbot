@@ -16,9 +16,6 @@ pub const COMMAND: Command = Command {
     run: |ctx| Box::pin(run(ctx)),
 };
 
-const NAMESPACE: &str = "flux-system";
-const TERRAFORM: &str = "production";
-const PLAN_CONFIGMAP: &str = "tfplan-default-production";
 /// An event caps at 65 KB and holds the text twice, plain and as escaped HTML.
 const MAX_PLAN_BYTES: usize = 20_000;
 
@@ -30,18 +27,28 @@ async fn run(ctx: Ctx) -> Reply {
 pub struct Plan {
     terraform: DynamicObject,
     stored: Option<ConfigMap>,
+    kubectl_context: String,
 }
 
 impl Plan {
     pub async fn fetch(cluster: &Cluster) -> anyhow::Result<Self> {
         let gvk = GroupVersionKind::gvk("infra.contrib.fluxcd.io", "v1alpha2", "Terraform");
-        let terraforms = cluster.custom(&gvk, "terraforms", NAMESPACE);
-        let terraform = terraforms.get(TERRAFORM).await?;
-
-        let stored = Api::<ConfigMap>::namespaced(cluster.kube.clone(), NAMESPACE)
-            .get_opt(PLAN_CONFIGMAP)
+        let (namespace, name) = (&cluster.tofu_namespace, &cluster.tofu_terraform);
+        let terraform = cluster
+            .custom(&gvk, "terraforms", namespace)
+            .get(name)
             .await?;
-        Ok(Self { terraform, stored })
+
+        // tofu-controller's name for the plan of the `default` workspace.
+        let stored = Api::<ConfigMap>::namespaced(cluster.kube.clone(), namespace)
+            .get_opt(&format!("tfplan-default-{name}"))
+            .await?;
+        let kubectl_context = cluster.kubectl_context.clone();
+        Ok(Self {
+            terraform,
+            stored,
+            kubectl_context,
+        })
     }
 
     /// A non-empty field of the Terraform object's `status.plan`.
@@ -67,7 +74,10 @@ impl Plan {
     }
 
     pub fn render(&self) -> Reply {
-        let mut reply = format!("**Tofu** `{TERRAFORM}`");
+        let metadata = &self.terraform.metadata;
+        let name = metadata.name.as_deref().unwrap_or_default();
+        let namespace = metadata.namespace.as_deref().unwrap_or_default();
+        let mut reply = format!("**Tofu** `{name}`");
         if let Some(ready) = condition(&self.terraform, "Ready") {
             write!(reply, ": ready `{}` (`{}`)", ready.status, ready.reason)?;
         }
@@ -103,8 +113,9 @@ impl Plan {
 
         let patch = format!(r#"{{"spec":{{"approvePlan":"{pending}"}}}}"#);
         let apply = format!(
-            "kubectl --context homelab -n {NAMESPACE} patch terraform {TERRAFORM} \
-             --type merge --field-manager tofu-approve -p '{patch}'"
+            "kubectl --context {} -n {namespace} patch terraform {name} \
+             --type merge --field-manager tofu-approve -p '{patch}'",
+            self.kubectl_context
         );
         write!(reply, "\n\nApply with:\n\n{}", code_block(&apply))?;
         Ok(reply)
@@ -121,19 +132,24 @@ mod tests {
         let terraform = serde_json::from_value(json!({
             "apiVersion": "infra.contrib.fluxcd.io/v1alpha2",
             "kind": "Terraform",
-            "metadata": { "name": TERRAFORM },
+            "metadata": { "name": "production", "namespace": "flux-system" },
             "status": {
                 "plan": { "pending": pending, "lastApplied": "plan-main-old" },
                 "conditions": [{ "type": "Ready", "status": "Unknown", "reason": "Planned" }],
             },
         }))
         .unwrap();
-        Plan { terraform, stored }
+        let kubectl_context = "homelab".to_owned();
+        Plan {
+            terraform,
+            stored,
+            kubectl_context,
+        }
     }
 
     fn stored(saved: &str, text: &str) -> Option<ConfigMap> {
         let config_map = serde_json::from_value(json!({
-            "metadata": { "name": PLAN_CONFIGMAP, "annotations": { "savedPlan": saved } },
+            "metadata": { "name": "tfplan-default-production", "annotations": { "savedPlan": saved } },
             "data": { "tfplan": text },
         }));
         Some(config_map.unwrap())
@@ -148,7 +164,7 @@ mod tests {
         assert!(reply.contains("**Pending:** `plan-main-new`"));
         assert!(reply.contains("```\nPlan: 1 to add\n```"));
         assert!(reply.contains(
-            r#"patch terraform production --type merge --field-manager tofu-approve -p '{"spec":{"approvePlan":"plan-main-new"}}'"#
+            r#"kubectl --context homelab -n flux-system patch terraform production --type merge --field-manager tofu-approve -p '{"spec":{"approvePlan":"plan-main-new"}}'"#
         ));
     }
 

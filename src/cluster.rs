@@ -8,15 +8,16 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 
 use crate::config::Config;
 
-const CI_NAMESPACE: &str = "tekton-ci";
-/// Enough to see why a step failed, small enough for a chat message.
-const LOG_LINES: i64 = 30;
-
 #[derive(Clone)]
 pub struct Cluster {
     pub kube: kube::Client,
     pub dashboard_url: String,
     pub ops_room: OwnedRoomId,
+    ci_namespace: String,
+    ci_log_lines: i64,
+    pub tofu_namespace: String,
+    pub tofu_terraform: String,
+    pub kubectl_context: String,
 }
 
 impl Cluster {
@@ -27,6 +28,11 @@ impl Cluster {
                 .context("no Kubernetes config")?,
             dashboard_url: config.tekton_dashboard_url.clone(),
             ops_room: config.ops_room.clone(),
+            ci_namespace: config.tekton_namespace.clone(),
+            ci_log_lines: config.ci_log_lines,
+            tofu_namespace: config.tofu_namespace.clone(),
+            tofu_terraform: config.tofu_terraform.clone(),
+            kubectl_context: config.kubectl_context.clone(),
         })
     }
 
@@ -36,7 +42,7 @@ impl Cluster {
 
     fn tekton(&self, kind: &str, plural: &str) -> Api<DynamicObject> {
         let gvk = GroupVersionKind::gvk("tekton.dev", "v1", kind);
-        self.custom(&gvk, plural, CI_NAMESPACE)
+        self.custom(&gvk, plural, &self.ci_namespace)
     }
 
     /// A custom resource, which has no typed API in k8s-openapi.
@@ -86,10 +92,10 @@ impl Cluster {
             .context("no failed step found")?;
         let params = LogParams {
             container: Some(step.container.to_owned()),
-            tail_lines: Some(LOG_LINES),
+            tail_lines: Some(self.ci_log_lines),
             ..LogParams::default()
         };
-        let pods = Api::<Pod>::namespaced(self.kube.clone(), CI_NAMESPACE);
+        let pods = Api::<Pod>::namespaced(self.kube.clone(), &self.ci_namespace);
         Ok(pods.logs(step.pod, &params).await?)
     }
 
@@ -166,8 +172,9 @@ pub fn run_name(run: &DynamicObject) -> &str {
 /// Markdown link to the run in the Tekton dashboard.
 pub fn run_link(dashboard_url: &str, run: &DynamicObject) -> String {
     let name = run_name(run);
+    let namespace = run.metadata.namespace.as_deref().unwrap_or_default();
     let url = dashboard_url.trim_end_matches('/');
-    format!("[{name}]({url}/#/namespaces/{CI_NAMESPACE}/pipelineruns/{name})")
+    format!("[{name}]({url}/#/namespaces/{namespace}/pipelineruns/{name})")
 }
 
 #[cfg(test)]
@@ -175,7 +182,7 @@ pub fn test_run(name: &str, status: &str, reason: &str) -> DynamicObject {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "tekton.dev/v1",
         "kind": "PipelineRun",
-        "metadata": { "name": name, "uid": name },
+        "metadata": { "name": name, "namespace": "tekton-ci", "uid": name },
         "status": {
             "startTime": format!("2026-10-30T10:00:0{}Z", name.len() % 10),
             "completionTime": "2026-10-30T11:00:00Z",

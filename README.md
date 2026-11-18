@@ -15,6 +15,11 @@ It joins rooms it's invited to and answers `!commands` (`!help` lists them) as r
 | `HEALTH_ADDR` | no (`0.0.0.0:8080`) | where the health probes are served |
 | `TEKTON_DASHBOARD_URL` | yes | e.g. `https://tekton.local.casasulgorgo.net`, for links to CI runs |
 | `OPS_ROOM` | yes | room ID, the only room where `!ci`, `!tofu` and `!kyverno` answer and where CI runs, tofu plans, policy failures and stuck pods are posted; use an encrypted, invite-only room |
+| `TEKTON_NAMESPACE` | no (`tekton-ci`) | where the PipelineRuns and their pods are |
+| `CI_LOG_LINES` | no (`30`) | how many log lines of a failed CI step are posted |
+| `TOFU_NAMESPACE` | no (`flux-system`) | where the tofu-controller `Terraform` object is |
+| `TOFU_TERRAFORM` | no (`production`) | the `Terraform` object whose plans `!tofu` shows and drift alerts post |
+| `KUBECTL_CONTEXT` | no (`homelab`) | kubeconfig context in the `kubectl` command shown to apply a plan |
 | `TOFU_POLL_MINUTES` | no (`30`) | how often the pending tofu plan is checked |
 | `TEKTON_GC_HOURS` | no (`24`) | a CI run still running after this long is forgotten, in case its end was missed |
 | `ALERT_REPOST_HOURS` | no (`24`) | a Kyverno failure or stuck pod that keeps coming back is posted at most once per this |
@@ -36,13 +41,13 @@ The private keys live in `store/`, so a new device can't sign itself and the war
 
 The bot talks to Kubernetes with the in-cluster service account, or the local kubeconfig when run outside the cluster, and only reads:
 
-- `!ci` lists PipelineRuns in `tekton-ci`, linking to the Tekton dashboard.
+- `!ci` lists PipelineRuns in `TEKTON_NAMESPACE`, linking to the Tekton dashboard.
 - Each run's start is posted to `OPS_ROOM`, and the message is edited into the result when it ends; since clients usually don't notify on edits, a failure also gets a reply with the last log lines of the failed step. Runs that start and end while the bot is down aren't posted.
-- `!tofu` shows the pending plan of the `production` Terraform in `flux-system`, and the `kubectl` command to approve it. Applying is left to whoever runs that command. Every `TOFU_POLL_MINUTES`, a pending plan is posted the same way, as a reminder of the drift, once its readable text is stored.
+- `!tofu` shows the pending plan of the `TOFU_TERRAFORM` Terraform in `TOFU_NAMESPACE`, and the `kubectl` command to approve it. Applying is left to whoever runs that command. Every `TOFU_POLL_MINUTES`, a pending plan is posted the same way, as a reminder of the drift, once its readable text is stored.
 - `!kyverno` lists the `fail` results in Kyverno's PolicyReports and ClusterPolicyReports, which cover audit-mode policies and background scans. Each failure is also posted when it first shows up in a report: a background scan rewriting the same results stays quiet, a fixed failure that comes back is posted again. Failures already there when the bot starts aren't posted, and one that keeps flapping is posted at most once per `ALERT_REPOST_HOURS`.
 - Containers that are OOM-killed, or waiting for one of `POD_STUCK_REASONS`, are posted the same way, in any namespace, an OOM kill with the container's memory limit.
 
-The service account needs, in `tekton-ci`: `get`, `list`, `watch` on `pipelineruns`, `list` on `taskruns`, `get` on `pods/log`; in `flux-system`: `get` on `terraforms` and `configmaps`; cluster-wide: `list`, `watch` on `pods`, and on `policyreports` and `clusterpolicyreports` (`wgpolicyk8s.io`).
+The service account needs, in `TEKTON_NAMESPACE`: `get`, `list`, `watch` on `pipelineruns`, `list` on `taskruns`, `get` on `pods/log`; in `TOFU_NAMESPACE`: `get` on `terraforms` and `configmaps`; cluster-wide: `list`, `watch` on `pods`, and on `policyreports` and `clusterpolicyreports` (`wgpolicyk8s.io`).
 Failure logs are posted as they are: a step that prints a secret puts it in the room's history.
 
 ## Health probes

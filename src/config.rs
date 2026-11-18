@@ -22,6 +22,15 @@ pub struct Config {
     pub recovery_passphrase: Option<String>,
     pub health_addr: SocketAddr,
     pub tekton_dashboard_url: String,
+    /// Where the PipelineRuns and their pods are.
+    pub tekton_namespace: String,
+    /// How many log lines of a failed CI step are posted.
+    pub ci_log_lines: i64,
+    pub tofu_namespace: String,
+    /// The tofu-controller `Terraform` object whose plans are shown.
+    pub tofu_terraform: String,
+    /// Put in the `kubectl` command that applies a plan.
+    pub kubectl_context: String,
     /// Where cluster commands are allowed and CI alerts go.
     pub ops_room: OwnedRoomId,
     /// How often the pending tofu plan is checked.
@@ -50,6 +59,13 @@ impl Config {
                 .context("HEALTH_ADDR must be <ip>:<port>")?,
             tekton_dashboard_url: var("TEKTON_DASHBOARD_URL")?
                 .context("TEKTON_DASHBOARD_URL is required")?,
+            tekton_namespace: var("TEKTON_NAMESPACE")?.unwrap_or_else(|| "tekton-ci".into()),
+            ci_log_lines: positive("CI_LOG_LINES", 30)?
+                .try_into()
+                .context("CI_LOG_LINES is too big")?,
+            tofu_namespace: var("TOFU_NAMESPACE")?.unwrap_or_else(|| "flux-system".into()),
+            tofu_terraform: var("TOFU_TERRAFORM")?.unwrap_or_else(|| "production".into()),
+            kubectl_context: var("KUBECTL_CONTEXT")?.unwrap_or_else(|| "homelab".into()),
             ops_room: var("OPS_ROOM")?
                 .context("OPS_ROOM is required")?
                 .parse()
