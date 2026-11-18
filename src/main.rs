@@ -9,6 +9,7 @@ mod problems;
 mod session;
 
 use anyhow::Context;
+use kube::runtime::watcher;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::{Client, LoopCtrl};
 use tokio::signal::unix::{self, SignalKind};
@@ -56,15 +57,20 @@ async fn main() -> anyhow::Result<()> {
         repost_after: config.alert_repost_after,
     };
     for reports in [cluster.policy_reports(), cluster.cluster_policy_reports()] {
-        let watch = alerter
-            .clone()
-            .watch_problems(reports, problems::policy_failures);
+        let watch = alerter.clone().watch_problems(
+            reports,
+            watcher::Config::default(),
+            problems::policy_failures,
+        );
         tokio::spawn(watch);
     }
     let reasons = cluster.pod_stuck_reasons.clone();
-    tokio::spawn(alerter.watch_problems(cluster.pods(), move |pod| {
-        problems::stuck_containers(pod, &reasons)
-    }));
+    let unfinished = watcher::Config::default().fields(cluster::UNFINISHED_PODS);
+    tokio::spawn(
+        alerter.watch_problems(cluster.pods(), unfinished, move |pod| {
+            problems::stuck_containers(pod, &reasons)
+        }),
+    );
     tokio::spawn(alerts::poll_tofu(client.clone(), cluster, config.tofu_poll));
     let user = client.user_id().context("no user ID after login")?;
     info!(%user, "ready");

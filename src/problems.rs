@@ -3,7 +3,7 @@
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::api::{DynamicObject, ListParams};
 
-use crate::cluster::Cluster;
+use crate::cluster::{self, Cluster, UNFINISHED_PODS};
 use crate::commands::kyverno;
 use crate::markdown::{MAX_LIST_BYTES, bullets};
 
@@ -16,15 +16,13 @@ pub struct Problem {
 
 /// Every problem in the cluster right now.
 pub async fn current(cluster: &Cluster) -> anyhow::Result<Vec<Problem>> {
-    let reports = cluster.list_policy_reports().await?;
-    let pods = cluster.pods().list(&ListParams::default()).await?;
+    let mut found = cluster.find_in_policy_reports(policy_failures).await?;
+    let pods = ListParams::default().fields(UNFINISHED_PODS);
     let reasons = &cluster.pod_stuck_reasons;
-    let failures = reports.iter().flat_map(policy_failures);
-    let stuck = pods
-        .items
-        .iter()
-        .flat_map(|pod| stuck_containers(pod, reasons));
-    Ok(failures.chain(stuck).collect())
+    let stuck =
+        cluster::find_in(&cluster.pods(), pods, |pod| stuck_containers(pod, reasons)).await?;
+    found.extend(stuck);
+    Ok(found)
 }
 
 /// One message listing `lines` under `title`.

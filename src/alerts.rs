@@ -36,7 +36,7 @@ const RUNNING_KEY: &str = "tekton.running";
 /// A run's start is posted, then edited into its result when it ends; a failure
 /// also gets a reply with the logs.
 pub async fn watch_ci(client: Client, cluster: Cluster, forget_after: Duration) {
-    let mut events = pin!(events(cluster.pipeline_runs()));
+    let mut events = pin!(events(cluster.pipeline_runs(), watcher::Config::default()));
     let mut running = Running::load(&client).await;
     while let Some(event) = events.next().await {
         running.forget_older_than(forget_after);
@@ -122,12 +122,12 @@ pub async fn poll_tofu(client: Client, cluster: Cluster, every: Duration) {
 }
 
 /// A watch's events, forever. The watcher re-lists and retries by itself; errors are only logged.
-fn events<K>(api: Api<K>) -> impl Stream<Item = watcher::Event<K>>
+fn events<K>(api: Api<K>, config: watcher::Config) -> impl Stream<Item = watcher::Event<K>>
 where
     K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
 {
     let url = api.resource_url().to_owned();
-    watcher::watcher(api, watcher::Config::default())
+    watcher::watcher(api, config)
         .default_backoff()
         .filter_map(move |event| {
             future::ready(
@@ -149,14 +149,19 @@ pub struct Alerter {
 
 impl Alerter {
     /// Watches forever, posting each problem `find` sees on an object once,
-    /// when it shows up.
-    pub async fn watch_problems<K>(self, api: Api<K>, find: impl Fn(&K) -> Vec<Problem>)
-    where
+    /// when it shows up. `config` narrows the watch server-side, e.g. to
+    /// unfinished pods.
+    pub async fn watch_problems<K>(
+        self,
+        api: Api<K>,
+        config: watcher::Config,
+        find: impl Fn(&K) -> Vec<Problem>,
+    ) where
         K: Resource + Clone + DeserializeOwned + Debug + Send + 'static,
     {
         let key = format!("tekton.problems{}", api.resource_url());
         let mut problems = Problems::load(&self.client, &key).await;
-        let mut events = pin!(events(api));
+        let mut events = pin!(events(api, config));
         while let Some(event) = events.next().await {
             problems.forget_posted_older_than(self.repost_after);
             for line in problems.change(&event, &find) {

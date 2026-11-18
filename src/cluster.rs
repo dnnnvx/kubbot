@@ -1,12 +1,20 @@
 //! What the ops commands and alerts need from the Kubernetes cluster.
 
+use std::fmt::Debug;
+
 use anyhow::Context;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams};
 use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+use serde::de::DeserializeOwned;
 
 use crate::config::Config;
+
+/// Pods that can still be stuck: one that ran to completion can't. Failed ones stay, e.g. an OOM-killed Job.
+pub const UNFINISHED_PODS: &str = "status.phase!=Succeeded";
+/// Objects per page when listing, so a big cluster comes in pieces instead of one huge response.
+const PAGE_SIZE: u32 = 500;
 
 #[derive(Clone)]
 pub struct Cluster {
@@ -68,12 +76,15 @@ impl Cluster {
         self.reports("ClusterPolicyReport", "clusterpolicyreports")
     }
 
-    /// Kyverno's results, namespaced and cluster-scoped.
-    pub async fn list_policy_reports(&self) -> kube::Result<Vec<DynamicObject>> {
+    /// What `find` sees in Kyverno's results, namespaced and cluster-scoped.
+    pub async fn find_in_policy_reports<T>(
+        &self,
+        find: impl Fn(&DynamicObject) -> Vec<T>,
+    ) -> kube::Result<Vec<T>> {
         let params = ListParams::default();
-        let mut reports = self.policy_reports().list(&params).await?.items;
-        reports.extend(self.cluster_policy_reports().list(&params).await?.items);
-        Ok(reports)
+        let mut found = find_in(&self.policy_reports(), params.clone(), &find).await?;
+        found.extend(find_in(&self.cluster_policy_reports(), params, &find).await?);
+        Ok(found)
     }
 
     /// Every pod of the cluster.
@@ -112,6 +123,28 @@ impl Cluster {
     pub fn ensure_ops_room(&self, room: &RoomId) -> anyhow::Result<()> {
         anyhow::ensure!(room == self.ops_room, "only available in the ops room");
         Ok(())
+    }
+}
+
+/// What `find` sees in everything `api` lists. The API server pages the list:
+/// each page is checked as it comes, so only what `find` returns is held.
+pub async fn find_in<K, T>(
+    api: &Api<K>,
+    params: ListParams,
+    find: impl Fn(&K) -> Vec<T>,
+) -> kube::Result<Vec<T>>
+where
+    K: Clone + DeserializeOwned + Debug,
+{
+    let mut params = params.limit(PAGE_SIZE);
+    let mut found = Vec::new();
+    loop {
+        let page = api.list(&params).await?;
+        found.extend(page.items.iter().flat_map(&find));
+        match page.metadata.continue_ {
+            Some(token) if !token.is_empty() => params = params.continue_token(&token),
+            _ => return Ok(found),
+        }
     }
 }
 
@@ -278,6 +311,39 @@ mod tests {
             room.as_str(),
             "!hcNOO-kFitB4fJ15jq8k5Ju5H56mGzLYXIIdbuhJvXM"
         );
+    }
+
+    #[tokio::test]
+    async fn lists_page_by_page() {
+        use std::convert::Infallible;
+
+        use kube::client::Body;
+        use serde_json::json;
+
+        // A fake API server with two pages, the second asked for with the first's token.
+        let server = tower::service_fn(|request: http::Request<Body>| async move {
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            assert!(query.contains("limit=500"), "{query}");
+            let (names, next) = match query.contains("continue=page-2") {
+                true => (vec!["c"], ""),
+                false => (vec!["a", "b"], "page-2"),
+            };
+            let items: Vec<_> = names
+                .iter()
+                .map(|name| json!({ "metadata": { "name": name } }))
+                .collect();
+            let list = json!({ "metadata": { "continue": next }, "items": items });
+            let body = Body::from(serde_json::to_vec(&list).unwrap());
+            Ok::<_, Infallible>(http::Response::new(body))
+        });
+        let pods = Api::<Pod>::all(kube::Client::new(server, "default"));
+        let found = find_in(&pods, ListParams::default(), |pod: &Pod| {
+            let name = pod.metadata.name.clone().unwrap();
+            if name == "b" { vec![] } else { vec![name] }
+        })
+        .await
+        .unwrap();
+        assert_eq!(found, ["a", "c"]);
     }
 
     #[test]

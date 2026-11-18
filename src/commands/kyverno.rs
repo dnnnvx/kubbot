@@ -12,22 +12,22 @@ pub const COMMAND: Command = Command {
 };
 
 async fn run(ctx: Ctx) -> Reply {
-    Ok(render(&ctx.cluster.list_policy_reports().await?))
+    Ok(render(&ctx.cluster.find_in_policy_reports(lines).await?))
 }
 
-fn render(reports: &[DynamicObject]) -> String {
-    let lines: Vec<String> = reports
-        .iter()
-        .flat_map(failures)
-        .map(|failure| failure.line())
-        .collect();
+/// One line per failure in `report`.
+fn lines(report: &DynamicObject) -> Vec<String> {
+    failures(report).iter().map(Failure::line).collect()
+}
+
+fn render(lines: &[String]) -> String {
     if lines.is_empty() {
         return "**Kyverno:** no failing policies.".to_owned();
     }
     format!(
         "**Kyverno:** {} failing\n\n{}",
         lines.len(),
-        bullets(&lines, MAX_LIST_BYTES)
+        bullets(lines, MAX_LIST_BYTES)
     )
 }
 
@@ -104,13 +104,13 @@ mod tests {
             ]),
         );
         assert_eq!(
-            render(&[report]),
+            render(&lines(&report)),
             "**Kyverno:** 2 failing\n\n\
              - `signed` on ReplicaSet `piraeus/linstor-54997`: no signatures\n\
              - `labels/team` on ReplicaSet `piraeus/linstor-54997`: missing"
         );
         assert_eq!(
-            render(&[test_report("b", &json!([]))]),
+            render(&lines(&test_report("b", &json!([])))),
             "**Kyverno:** no failing policies."
         );
     }
