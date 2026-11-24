@@ -1,4 +1,4 @@
-# Keep in sync with the `rust:` image in the Dockerfile.
+# Nix (flake.nix) builds the image with this channel too, via rust-overlay.
 [toolchain]
 channel = "1.99"
 components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]
