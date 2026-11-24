@@ -43,8 +43,8 @@
           strictDeps = true;
           # fmt, clippy and tests run locally in the pre-commit hook (.githooks/pre-commit)
           doCheck = false;
-          # One rustc at a time: matrix-sdk is memory hungry and the build pod has 3Gi
-          CARGO_BUILD_JOBS = "1";
+          # Two rustc at a time, locally and in CI: matrix-sdk is memory hungry and the build pod has 3Gi
+          CARGO_BUILD_JOBS = "2";
         };
         # Dependencies in their own derivation, so source changes don't rebuild matrix-sdk (once cached)
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
